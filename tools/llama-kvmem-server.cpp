@@ -122,6 +122,13 @@ static void print_usage(const char * argv0) {
             "  --kvmem-ckpt-min-gap N     minimum rows between first-pass checkpoints (default 256)\n"
             "  --no-kvmem-keep-aborted    on cancel/failure roll back to the request start instead of\n"
             "                            the newest checkpoint of the aborted prefill\n"
+            "  --kvmem-pool-gb G          host RAM for parked conversations (default 12)\n"
+            "  --kvmem-pool-max N         parked conversations kept (default 6)\n"
+            "  --kvmem-pool-min-rows N    park only conversations with at least N rows (default 2048)\n"
+            "  --kvmem-pool-min-gain N    switch/fork only when it saves at least N rows (default 1024)\n"
+            "  --kvmem-pool-ckpts N       recurrent checkpoints kept per parked conversation (default 5)\n"
+            "  --kvmem-pool-ttl-min N     drop parked conversations idle for N minutes (default 0 = never)\n"
+            "  --no-kvmem-pool            single-conversation cache (prefix checkpoints only)\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe file in GiB (0 = off)\n"
@@ -216,6 +223,22 @@ struct MultimodalQuery {
     llama_kvmem_query_state state;
 };
 
+// One conversation parked in host RAM while another owns the single slot.
+struct PoolEntry {
+    PoolEntry() = default;
+    PoolEntry(const PoolEntry &) = delete;
+    PoolEntry & operator=(const PoolEntry &) = delete;
+    ~PoolEntry() { llama_kvmem_stash_free(stash); }
+    uint64_t id = 0;
+    llama_kvmem_stash * stash = nullptr;
+    std::shared_ptr<kvmem_prompt> prompt;
+    std::vector<MultimodalCheckpoint> checkpoints;
+    int rows = 0;
+    size_t bytes = 0;
+    std::chrono::steady_clock::time_point created, last_used;
+    uint32_t hits = 0;
+};
+
 struct ServerState {
     std::mutex mu;
     kvmem_server_progress progress;
@@ -274,6 +297,19 @@ struct ServerState {
     int mm_ckpt_min_gap = 256;
     bool mm_keep_aborted = true;
     llama_token mm_msg_token = LLAMA_TOKEN_NULL;
+    // Conversation pool: other conversations' KV kept in host RAM (LRU).
+    bool pool_enabled = true;
+    double pool_gb = 12.0;
+    int pool_max = 6;
+    int pool_min_rows = 2048;
+    int pool_min_gain = 1024;
+    int pool_ckpts = 5;
+    int pool_ttl_min = 0;
+    bool pool_reset_requested = false;
+    std::vector<std::unique_ptr<PoolEntry>> pool;
+    uint64_t pool_next_id = 1;
+    std::mutex pool_status_mu;
+    std::string pool_status = "{}";
     std::string mm_error;
     int mm_error_status = 500;
     bool mm_reset_requested = false;
@@ -1720,6 +1756,40 @@ int main(int argc, char ** argv) {
             }
         } else if (eq(arg, "--no-kvmem-keep-aborted")) {
             st.mm_keep_aborted = false;
+        } else if (eq(arg, "--kvmem-pool-gb")) {
+            st.pool_gb = kvmem_cli_real(arg, need(arg), 0, 1048576);
+        } else if (eq(arg, "--kvmem-pool-max")) {
+            st.pool_max = kvmem_cli_int(arg, need(arg));
+            if (st.pool_max < 0) {
+                fprintf(stderr, "invalid --kvmem-pool-max (want >= 0)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-pool-min-rows")) {
+            st.pool_min_rows = kvmem_cli_int(arg, need(arg));
+            if (st.pool_min_rows < 1) {
+                fprintf(stderr, "invalid --kvmem-pool-min-rows (want >= 1)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-pool-min-gain")) {
+            st.pool_min_gain = kvmem_cli_int(arg, need(arg));
+            if (st.pool_min_gain < 0) {
+                fprintf(stderr, "invalid --kvmem-pool-min-gain (want >= 0)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-pool-ckpts")) {
+            st.pool_ckpts = kvmem_cli_int(arg, need(arg));
+            if (st.pool_ckpts < 2) {
+                fprintf(stderr, "invalid --kvmem-pool-ckpts (want >= 2)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-pool-ttl-min")) {
+            st.pool_ttl_min = kvmem_cli_int(arg, need(arg));
+            if (st.pool_ttl_min < 0) {
+                fprintf(stderr, "invalid --kvmem-pool-ttl-min (want >= 0)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--no-kvmem-pool")) {
+            st.pool_enabled = false;
         } else if (eq(arg, "--kvmem-query-max-tokens")) {
             st.query_max_tokens = kvmem_cli_int(arg, need(arg));
             if (st.query_max_tokens <= 0) {
@@ -1974,6 +2044,9 @@ int main(int argc, char ** argv) {
         LOG_INF("srv    prefix checkpoints: max=%d interval=%d window=%d min_gap=%d keep_aborted=%d msg_token=%d\n",
                 st.mm_ckpt_max, st.mm_ckpt_interval, st.mm_ckpt_window, st.mm_ckpt_min_gap,
                 (int) st.mm_keep_aborted, (int) st.mm_msg_token);
+        LOG_INF("srv    kvmem pool: enabled=%d gb=%.1f max=%d min_rows=%d min_gain=%d ckpts=%d ttl_min=%d\n",
+                (int) st.pool_enabled, st.pool_gb, st.pool_max, st.pool_min_rows, st.pool_min_gain,
+                st.pool_ckpts, st.pool_ttl_min);
     }
     try {
         st.tmpls = common_chat_templates_init(st.model, chat_template);
@@ -2173,6 +2246,12 @@ int main(int argc, char ** argv) {
         }
         res.set_content(json::array({slot}).dump(), "application/json");
     });
+    // Snapshot published by the request thread; never waits for inference.
+    svr.Get("/kvmem/pool", [&](const httplib::Request &, httplib::Response & res) {
+        res.set_header("Cache-Control", "no-store");
+        std::lock_guard<std::mutex> lk(st.pool_status_mu);
+        res.set_content(st.pool_status, "application/json");
+    });
     svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
         json j = {
             {"object", "list"},
@@ -2210,6 +2289,11 @@ int main(int argc, char ** argv) {
             res.set_content("{\"error\":\"cache_reset must be a boolean\"}", "application/json");
             return;
         }
+        if (body.contains("pool_reset") && !body["pool_reset"].is_boolean()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"pool_reset must be a boolean\"}", "application/json");
+            return;
+        }
 
         cr.sampling = kvmem_chat_sampling_defaults(cr.enable_thinking);
         if (!kvmem_chat_sampling_override(st.sampling_overrides, cr.sampling, err) ||
@@ -2222,6 +2306,7 @@ int main(int argc, char ** argv) {
         auto slot = std::make_shared<kvmem_server_slot_guard>(st.mu, st.progress);
         if (req.is_connection_closed && req.is_connection_closed()) return;
         st.mm_reset_requested = body.value("cache_reset", false);
+        st.pool_reset_requested = body.value("pool_reset", false);
 
         common_chat_templates_inputs inputs;
         inputs.messages = cr.msgs;

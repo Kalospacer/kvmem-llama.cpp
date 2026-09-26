@@ -164,4 +164,15 @@ LLAMA_API bool llama_kvmem_set_query(const llama_kvmem_query_state & state);
 LLAMA_API void llama_kvmem_freeze_query(bool frozen);
 LLAMA_API void llama_kvmem_get_tail_mean(uint32_t row, std::vector<float> & state);
 LLAMA_API void llama_kvmem_set_tail_mean(uint32_t row, const std::vector<float> & state);
+
+// Conversation pool: host-side KV of one whole sequence, detached from the live
+// slot. take leaves the live memory empty (caller then llama_memory_clear's both
+// contexts); put consumes the stash; fork copies its first rows. put/fork need
+// an empty live memory and return false on failure (live left empty).
+struct llama_kvmem_stash;
+LLAMA_API llama_kvmem_stash * llama_kvmem_stash_take(uint32_t max_rows, uint32_t * rows);
+LLAMA_API bool llama_kvmem_stash_put(llama_kvmem_stash * stash);
+LLAMA_API bool llama_kvmem_stash_fork(const llama_kvmem_stash * stash, uint32_t rows);
+LLAMA_API size_t llama_kvmem_stash_bytes(const llama_kvmem_stash * stash);
+LLAMA_API void llama_kvmem_stash_free(llama_kvmem_stash * stash);
 #endif

@@ -380,5 +380,36 @@ int main() {
         CHECK(tail_store.copy_k_gpu(0, 0, gout4.data(), 3));
         CHECK(tail_store.copy_v_gpu(0, 0, gout4.data(), 3));
     }
+    {
+        // clone_prefix: deep copy of the first rows, partial tail block kept.
+        kvmem::RawKvStoreConfig ccfg;
+        ccfg.n_layer = 1;
+        ccfg.n_embd_k = 4;
+        ccfg.n_embd_v = 4;
+        ccfg.block_tokens = 2;
+        ccfg.k_gpu_row_bytes = 3;
+        ccfg.v_gpu_row_bytes = 3;
+        kvmem::RawKvStore src(ccfg);
+        std::vector<uint8_t> rows(15);
+        for (int i = 0; i < 15; ++i) rows[static_cast<size_t>(i)] = static_cast<uint8_t>(i + 1);
+        for (uint32_t pos = 0; pos < 5; pos += 2) {
+            const uint32_t n = pos + 2 <= 5 ? 2 : 1;
+            src.write_layer_k_gpu(pos, n, 0, rows.data() + pos * 3);
+            src.write_layer_v_gpu(pos, n, 0, rows.data() + pos * 3);
+        }
+        auto clone = src.clone_prefix(3);
+        CHECK(clone->has_k_gpu(0, 0, 2) && clone->has_v_gpu(0, 0, 2));
+        CHECK(clone->has_k_gpu(1, 0, 1) && !clone->has_k_gpu(1, 0, 2));
+        CHECK(!clone->has_k_gpu(2, 0, 1));
+        CHECK(src.has_k_gpu(1, 0, 2) && src.has_k_gpu(2, 0, 1));
+        std::vector<uint8_t> got(6, 0);
+        CHECK(clone->copy_k_gpu(1, 0, got.data(), 1));
+        CHECK(got[0] == 7 && got[2] == 9);
+        std::vector<uint8_t> other(6, 200);
+        clone->write_layer_k_gpu(0, 2, 0, other.data());
+        CHECK(src.copy_k_gpu(0, 0, got.data(), 2));
+        CHECK(got[0] == 1 && got[5] == 6);
+        CHECK(src.clone_prefix(0)->bytes_k() == 0);
+    }
     return 0;
 }

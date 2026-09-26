@@ -89,6 +89,19 @@ public:
     void truncate_cached(uint32_t n) { raw_->truncate_to(n); }
     void invalidate_packed_from(uint32_t n) { raw_->invalidate_packed_from(n); }
 
+    // Conversation pool: the draft raw store travels with the target's stash.
+    bool can_stash() const { return raw_ && !raw_->nvme_enabled(); }
+    bool raw_complete(uint32_t block_id, uint32_t n) const {
+        return raw_->has_k_gpu(block_id, 0, n) && (v_trans_ || raw_->has_v_gpu(block_id, 0, n));
+    }
+    const kvmem::RawKvStore & raw() const { return *raw_; }
+    std::unique_ptr<kvmem::RawKvStore> take_raw() {
+        auto out = std::move(raw_);
+        raw_ = std::make_unique<kvmem::RawKvStore>(out->config());
+        return out;
+    }
+    void put_raw(std::unique_ptr<kvmem::RawKvStore> raw) { raw_ = std::move(raw); }
+
 private:
     bool fill_from_target(const llama_ubatch & ubatch, llama_kv_cache::slot_info & out);
     void write_block_to_gpu(uint32_t block_id);

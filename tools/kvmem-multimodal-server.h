@@ -303,6 +303,236 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
     return 0;
 }
 
+// ---- Conversation pool ------------------------------------------------------
+// The slot holds one live conversation. Others are parked as host-side stashes
+// with their recurrent checkpoints; a request that continues a parked
+// conversation swaps it back (take) or copies its shared prefix (fork).
+
+static bool pool_active(const ServerState & st) {
+    return st.pool_enabled && st.kparams.enabled && st.pool_max > 0 && st.mm_msg_token != LLAMA_TOKEN_NULL;
+}
+
+// Largest checkpoint row (> 0) this conversation can resume the prompt from.
+static int pool_resume_row(const kvmem_prompt & prompt, int cap, const kvmem_prompt * cached, int rows,
+                           const std::vector<MultimodalCheckpoint> & checkpoints, int * lcp_out) {
+    if (lcp_out) *lcp_out = 0;
+    if (!cached || cached->has_media()) return -1;
+    const int lcp = (int) prompt.common_prefix(*cached);
+    if (lcp_out) *lcp_out = lcp;
+    const int keep = std::min({lcp, rows, cap});
+    int best = -1;
+    for (const auto & checkpoint : checkpoints) {
+        if (checkpoint.data && checkpoint.row > 0 && checkpoint.row <= keep && checkpoint.row > best) best = checkpoint.row;
+    }
+    return best;
+}
+
+// Would dropping rows (lcp, rows] lose something a later request can resume?
+// A checkpoint at a message start means a later turn of that branch lands
+// there; the rewritten tail of the current turn only holds query/end rows.
+static bool pool_branch_worth(const ServerState & st, const kvmem_prompt & cached, int rows,
+                              const std::vector<MultimodalCheckpoint> & checkpoints, int lcp, bool unrelated) {
+    if (rows < st.pool_min_rows || rows - std::max(lcp, 0) < st.pool_min_gain) return false;
+    for (const auto & checkpoint : checkpoints) {
+        if (!checkpoint.data || checkpoint.row <= lcp || checkpoint.row > rows) continue;
+        if (unrelated && checkpoint.row >= st.pool_min_rows) return true;
+        if (checkpoint.row < (int) cached.tokens.size() && cached.tokens[checkpoint.row] == st.mm_msg_token) return true;
+    }
+    return false;
+}
+
+static void pool_publish(ServerState & st) {
+    const auto now = std::chrono::steady_clock::now();
+    json entries = json::array();
+    size_t total = 0;
+    for (const auto & e : st.pool) {
+        json rows = json::array();
+        for (const auto & c : e->checkpoints) rows.push_back(c.row);
+        entries.push_back({{"id", e->id}, {"rows", e->rows}, {"bytes", e->bytes}, {"hits", e->hits},
+                           {"age_s", std::chrono::duration<double>(now - e->created).count()},
+                           {"idle_s", std::chrono::duration<double>(now - e->last_used).count()},
+                           {"checkpoint_rows", rows}});
+        total += e->bytes;
+    }
+    json j = {{"enabled", pool_active(st)}, {"entries", entries}, {"total_bytes", total},
+              {"budget_bytes", (uint64_t) (st.pool_gb * 1073741824.0)}, {"max_entries", st.pool_max},
+              {"live_rows", st.mm_live_row}};
+    std::lock_guard<std::mutex> lk(st.pool_status_mu);
+    st.pool_status = j.dump();
+}
+
+static size_t pool_total_bytes(const ServerState & st) {
+    size_t n = 0;
+    for (const auto & e : st.pool) n += e->bytes;
+    return n;
+}
+
+static void pool_evict(ServerState & st, const PoolEntry * keep = nullptr) {
+    const auto now = std::chrono::steady_clock::now();
+    const size_t budget = (size_t) (st.pool_gb * 1073741824.0);
+    auto drop = [&](size_t i, const char * reason) {
+        const auto & e = *st.pool[i];
+        LOG_INF("srv    kvmem pool: evict id=%llu rows=%d bytes=%.2fGB hits=%u reason=%s\n",
+                (unsigned long long) e.id, e.rows, e.bytes / 1073741824.0, e.hits, reason);
+        st.pool.erase(st.pool.begin() + (std::ptrdiff_t) i);
+    };
+    if (st.pool_ttl_min > 0) {
+        for (size_t i = st.pool.size(); i-- > 0;) {
+            if (st.pool[i].get() != keep && now - st.pool[i]->last_used > std::chrono::minutes(st.pool_ttl_min)) drop(i, "ttl");
+        }
+    }
+    while (!st.pool.empty() && ((int) st.pool.size() > st.pool_max || pool_total_bytes(st) > budget)) {
+        size_t victim = st.pool.size();
+        for (size_t i = 0; i < st.pool.size(); ++i) {
+            if (st.pool[i].get() == keep) continue;
+            if (victim == st.pool.size() || st.pool[i]->last_used < st.pool[victim]->last_used) victim = i;
+        }
+        if (victim == st.pool.size()) break;
+        drop(victim, (int) st.pool.size() > st.pool_max ? "lru" : "bytes");
+    }
+}
+
+// Move the live conversation into the pool. The live memory is left empty
+// (llama_memory_clear'ed by memory_clear_all). Returns the new entry or null.
+static PoolEntry * pool_stash_live(ServerState & st, const char * reason) {
+    const auto started = std::chrono::steady_clock::now();
+    uint32_t rows = 0;
+    llama_synchronize(st.ctx);
+    if (st.spec.ctx_dft) llama_synchronize(st.spec.ctx_dft);
+    llama_kvmem_stash * stash = llama_kvmem_stash_take((uint32_t) st.mm_live_row, &rows);
+    if (!stash) {
+        LOG_WRN("srv    kvmem pool: stash failed live_rows=%d reason=%s\n", st.mm_live_row, reason);
+        memory_clear_all(st);
+        return nullptr;
+    }
+    auto e = std::make_unique<PoolEntry>();
+    e->stash = stash;
+    e->id = st.pool_next_id++;
+    e->rows = (int) rows;
+    e->prompt = st.cached_prompt->prefix(rows);
+    std::vector<MultimodalCheckpoint> kept;
+    for (const auto & c : st.mm_checkpoints) {
+        if (c.data && c.row > 0 && c.row <= e->rows) kept.push_back(c);
+    }
+    // A later turn of this conversation resumes at a message start; the rows
+    // inside the rewritten tail (query, eval_end, commit) are rarely reused.
+    // Drop those first, oldest first, and always keep the oldest entry.
+    auto msg_start = [&](const MultimodalCheckpoint & c) {
+        return c.row < (int) st.cached_prompt->tokens.size() && st.cached_prompt->tokens[c.row] == st.mm_msg_token;
+    };
+    while ((int) kept.size() > st.pool_ckpts) {
+        auto victim = std::find_if(kept.begin() + 1, kept.end(), [&](const auto & c) { return !msg_start(c); });
+        kept.erase(victim != kept.end() ? victim : kept.begin() + 1);
+    }
+    e->checkpoints = std::move(kept);
+    e->bytes = llama_kvmem_stash_bytes(stash);
+    for (const auto & c : e->checkpoints) e->bytes += c.data->bytes();
+    e->created = e->last_used = std::chrono::steady_clock::now();
+    memory_clear_all(st);
+    LOG_INF("srv    kvmem pool: stash id=%llu rows=%d ckpts=%zu bytes=%.2fGB ms=%.1f reason=%s entries=%zu\n",
+            (unsigned long long) e->id, e->rows, e->checkpoints.size(), e->bytes / 1073741824.0,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
+            reason, st.pool.size() + 1);
+    st.pool.push_back(std::move(e));
+    return st.pool.back().get();
+}
+
+// Make rows [0, rows) of a parked conversation live. take moves the entry out
+// of the pool; otherwise its prefix is copied and the entry stays parked.
+static bool pool_restore(ServerState & st, size_t index, int rows, bool take, int lcp) {
+    const auto started = std::chrono::steady_clock::now();
+    PoolEntry & e = *st.pool[index];
+    const uint64_t id = e.id;
+    std::shared_ptr<kvmem_prompt> prompt = take ? e.prompt : e.prompt->prefix(rows);
+    std::vector<MultimodalCheckpoint> checkpoints;
+    for (const auto & c : e.checkpoints) {
+        if (take || c.row <= rows) checkpoints.push_back(c);
+    }
+    const int live_rows = take ? e.rows : rows;
+    bool ok;
+    if (take) {
+        ok = llama_kvmem_stash_put(e.stash);
+        e.stash = nullptr;
+        st.pool.erase(st.pool.begin() + (std::ptrdiff_t) index);
+    } else {
+        ok = llama_kvmem_stash_fork(e.stash, (uint32_t) rows);
+        e.last_used = std::chrono::steady_clock::now();
+        e.hits++;
+    }
+    if (!ok) {
+        LOG_WRN("srv    kvmem pool: %s failed id=%llu rows=%d\n", take ? "take" : "fork", (unsigned long long) id, rows);
+        memory_clear_all(st);
+        return false;
+    }
+    st.cached_prompt = std::move(prompt);
+    st.cached_tokens = st.cached_prompt->tokens;
+    st.cached_tokens.resize(std::min(st.cached_tokens.size(), (size_t) live_rows));
+    st.mm_checkpoints = std::move(checkpoints);
+    st.mm_live_row = live_rows;
+    st.mm_live_checkpoint.reset();
+    st.mm_query.reset();
+    st.mm_pending_query.reset();
+    LOG_INF("srv    kvmem pool: %s id=%llu rows=%d resume=%d lcp=%d ms=%.1f entries=%zu\n",
+            take ? "take" : "fork", (unsigned long long) id, live_rows, rows, lcp,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
+            st.pool.size());
+    return true;
+}
+
+// Called once per request before the live checkpoint is chosen.
+static void multimodal_pool_route(ServerState & st, const kvmem_prompt & prompt, int eval_end) {
+    if (st.pool_reset_requested) {
+        if (!st.pool.empty()) LOG_INF("srv    kvmem pool: reset entries=%zu\n", st.pool.size());
+        st.pool.clear();
+        st.pool_reset_requested = false;
+    }
+    if (!pool_active(st) || prompt.has_media()) {
+        pool_publish(st);
+        return;
+    }
+    try {
+        const int cap = eval_end - (st.spec.ok ? 0 : 1);
+        int live_lcp = 0;
+        const int live_row = pool_resume_row(prompt, cap, st.cached_prompt.get(), st.mm_live_row, st.mm_checkpoints, &live_lcp);
+        size_t best = st.pool.size();
+        int best_row = -1, best_lcp = 0;
+        for (size_t i = 0; i < st.pool.size(); ++i) {
+            int lcp = 0;
+            const int row = pool_resume_row(prompt, cap, st.pool[i]->prompt.get(), st.pool[i]->rows, st.pool[i]->checkpoints, &lcp);
+            if (row > best_row) {
+                best = i;
+                best_row = row;
+                best_lcp = lcp;
+            }
+        }
+        const bool live_valuable = st.cached_prompt && !st.cached_prompt->has_media() &&
+            pool_branch_worth(st, *st.cached_prompt, st.mm_live_row, st.mm_checkpoints, live_lcp, live_row < 0);
+        if (best < st.pool.size() && best_row >= std::max(live_row, 0) + st.pool_min_gain) {
+            const PoolEntry * target = st.pool[best].get();
+            if (live_valuable && pool_stash_live(st, "switch")) {
+                best = (size_t) (std::find_if(st.pool.begin(), st.pool.end(), [&](const auto & e) { return e.get() == target; }) - st.pool.begin());
+            } else {
+                memory_clear_all(st);
+            }
+            const PoolEntry & e = *st.pool[best];
+            const bool fork = pool_branch_worth(st, *e.prompt, e.rows, e.checkpoints, best_lcp, false);
+            pool_restore(st, best, best_row, !fork, best_lcp);
+        } else if (live_valuable) {
+            // The request abandons the live branch: park it, keep only the shared prefix live.
+            PoolEntry * parked = pool_stash_live(st, live_row < 0 ? "miss" : "branch");
+            if (parked && live_row > 0) {
+                const size_t index = (size_t) (std::find_if(st.pool.begin(), st.pool.end(), [&](const auto & e) { return e.get() == parked; }) - st.pool.begin());
+                pool_restore(st, index, live_row, false, live_lcp);
+            }
+        }
+        pool_evict(st);
+    } catch (const std::exception & e) {
+        LOG_ERR("srv    kvmem pool: route failed: %s\n", e.what());
+        memory_clear_all(st);
+    }
+    pool_publish(st);
+}
+
 static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cache_hit) {
     const auto started = std::chrono::steady_clock::now();
     st.mm_perf = {};
@@ -312,6 +542,9 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
     try {
         st.mm_error.clear();
         st.mm_error_status = 500;
+        // cache_reset clears the live conversation and bypasses the pool for this
+        // request, so it always measures a cold prefill.
+        const bool cold = st.mm_reset_requested;
         if (st.mm_reset_requested) {
             kvmem_diag("KVMEM_TRACE multimodal_reset context=%p reason=explicit_cache_reset\n", (void *) st.ctx);
             memory_clear_all(st);
@@ -321,6 +554,12 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
         if (st.vision) st.vision->reset_stats();
         const auto & prompt = *st.active_prompt;
         const int eval_end = (int) prompt.tokens.size() - (st.spec.ok ? 1 : 0);
+        if (!cold) multimodal_pool_route(st, prompt, eval_end);
+        else if (st.pool_reset_requested) {
+            st.pool.clear();
+            st.pool_reset_requested = false;
+            pool_publish(st);
+        }
         const int lcp = st.cached_prompt ? (int) prompt.common_prefix(*st.cached_prompt) : 0;
         st.mm_lcp = lcp;
         // Sequence checkpoints do not restore logits. Ordinary decoding must evaluate

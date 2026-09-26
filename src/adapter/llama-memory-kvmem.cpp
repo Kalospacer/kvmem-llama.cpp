@@ -3267,6 +3267,159 @@ void llama_memory_kvmem::apply_selection(const llama_kvmem_selection & selection
     }
 }
 
+size_t llama_kvmem_stash::bytes() const {
+    size_t n = row_positions.size() * sizeof(row_positions[0]);
+    if (raw) n += raw->bytes_k() + raw->bytes_v();
+    if (mtp_raw) n += mtp_raw->bytes_k() + mtp_raw->bytes_v();
+    return n;
+}
+
+std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_rows) {
+    if (!runtime_ || !raw_ || !kv_ || v_trans_ || replay_ || raw_->nvme_enabled()) return nullptr;
+    if (mtp_ && !mtp_->can_stash()) return nullptr;
+    auto & store = runtime_->store();
+    const uint32_t total = std::min(store.total_tokens(), max_rows);
+    if (total == 0) return nullptr;
+
+    // Packed K/V of every resident block must be on the host before the GPU
+    // pages are dropped. Decode and retrieval pin the working set, which
+    // disables the async harvest, so harvest explicitly here.
+    decode_mean_flush();
+    decode_mean_discard();
+    harvest_flush();
+    harvest_gpu_v_commit();
+    std::vector<uint32_t> resident;
+    for (const auto & b : store.blocks()) {
+        if (b.gpu_slot < 0 || b.n_tokens == 0) continue;
+        resident.push_back(b.block_id);
+        harvest_gpu_v(b.block_id);
+    }
+    harvest_gpu_v_commit();
+    if (mtp_) mtp_->harvest_resident_v();
+
+    uint32_t rows = total;
+    for (const auto & b : store.blocks()) {
+        if (b.orig_pos_start >= rows) break;
+        const uint32_t n = std::min(b.n_tokens, rows - b.orig_pos_start);
+        bool ok = true;
+        for (uint32_t il = 0; il < n_layer_ && ok; ++il) {
+            if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) continue;
+            ok = raw_->has_k_gpu(b.block_id, il, n) && raw_->has_v_gpu(b.block_id, il, n);
+        }
+        if (ok && mtp_) ok = mtp_->raw_complete(b.block_id, n);
+        if (!ok) {
+            rows = b.orig_pos_start;
+            break;
+        }
+    }
+    if (rows != total || trace_) {
+        kvmem_diag("KVMEM_TRACE stash_take rows=%u total=%u resident=%zu\n", rows, total, resident.size());
+    }
+    if (rows == 0) return nullptr;
+
+    auto stash = std::make_unique<llama_kvmem_stash>();
+    stash->rows = rows;
+    stash->runtime = std::move(runtime_);
+    stash->raw = std::move(raw_);
+    stash->row_positions = std::move(row_positions_);
+    if (mtp_) stash->mtp_raw = mtp_->take_raw();
+    runtime_ = std::make_unique<kvmem::KvMemRuntime>(stash->runtime->config(), &backend_);
+    raw_ = std::make_unique<kvmem::RawKvStore>(stash->raw->config());
+    row_positions_.clear();
+
+    // The stashed blocks now live only on the host. Drop their GPU slots before
+    // truncation so the detached runtime never frees slots of the live pool.
+    auto & ss = stash->runtime->store();
+    for (uint32_t id : resident) {
+        ss.set_block_tier(id, kvmem::KvTier::CPU, -1, ss.blocks()[id].nvme_slot);
+        ss.set_block_io_in_flight(id, false);
+    }
+    ss.clear_working_set();
+    stash->runtime->truncate_to(rows);
+    stash->raw->truncate_to(rows);
+    if (stash->mtp_raw) stash->mtp_raw->truncate_to(rows);
+    if (stash->row_positions.size() > rows) stash->row_positions.resize(rows);
+    const uint32_t n_blocks = ss.block_count();
+    for (uint32_t id : resident) {
+        if (id < n_blocks) stash->resident.push_back(id);
+    }
+
+    kv_->clear(true);
+    if (mtp_) mtp_->clear(true);
+    reset_policy();
+    harvest_gpu_queued_.clear();
+    return stash;
+}
+
+bool llama_memory_kvmem::stash_restage(const std::vector<uint32_t> & resident) {
+    ++attention_epoch_;
+    reset_slots();
+    reset_query_acc();
+    explicit_spans_ = false;
+    query_frozen_ = false;
+    turn_spans_ = {};
+    retrieval_pinned_ = false;
+    keep_selected_ = false;
+    prefill_capture_ = true;
+    if (resident.empty()) return true;
+    // Prefill attends only to GPU-resident blocks, so the working set has to be
+    // back before the next append; retrieval would only run after the query.
+    const kvmem::KvMemPlan plan = runtime_->prepare_selection(resident);
+    trace_plan("stash_restage", plan);
+    apply_plan_to_kv(plan);
+    if (!layout_gpu_slots_by_orig_pos()) {
+        for (uint32_t id : plan.stage_in) {
+            if (id < runtime_->store().block_count() && runtime_->store().blocks()[id].gpu_slot >= 0) {
+                write_block_to_gpu(id);
+            }
+        }
+        kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
+    }
+    if (mtp_) mtp_->follow_retrieval();
+    for (uint32_t id : resident) {
+        if (runtime_->store().blocks()[id].gpu_slot < 0) {
+            LLAMA_LOG_ERROR("%s: block %u was not restaged\n", __func__, id);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_memory_kvmem::stash_put(std::unique_ptr<llama_kvmem_stash> stash) {
+    if (!stash || !stash->runtime || !stash->raw || store_n_tokens() != 0) return false;
+    if (mtp_ != nullptr && !stash->mtp_raw) return false;
+    harvest_flush();
+    harvest_gpu_v_commit();
+    runtime_ = std::move(stash->runtime);
+    raw_ = std::move(stash->raw);
+    row_positions_ = std::move(stash->row_positions);
+    if (mtp_) mtp_->put_raw(std::move(stash->mtp_raw));
+    return stash_restage(stash->resident);
+}
+
+bool llama_memory_kvmem::stash_fork(const llama_kvmem_stash & stash, uint32_t rows) {
+    if (!stash.runtime || !stash.raw || store_n_tokens() != 0) return false;
+    if (mtp_ != nullptr && !stash.mtp_raw) return false;
+    rows = std::min(rows, stash.rows);
+    if (rows == 0 || stash.row_positions.size() < rows) return false;
+    harvest_flush();
+    harvest_gpu_v_commit();
+    raw_ = stash.raw->clone_prefix(rows);
+    if (mtp_) mtp_->put_raw(stash.mtp_raw->clone_prefix(rows));
+    row_positions_.assign(stash.row_positions.begin(), stash.row_positions.begin() + rows);
+    runtime_ = std::make_unique<kvmem::KvMemRuntime>(stash.runtime->config(), &backend_);
+    runtime_->register_append(rows);
+    auto & store = runtime_->store();
+    for (uint32_t id = 0; id < store.block_count(); ++id) {
+        store.set_block_tier(id, kvmem::KvTier::CPU, -1, -1);
+    }
+    std::vector<uint32_t> resident;
+    for (uint32_t id : stash.resident) {
+        if (id < store.block_count()) resident.push_back(id);
+    }
+    return stash_restage(resident);
+}
+
 void llama_memory_kvmem::trace_working_set(const char * tag) const {
     if (!kv_ || !runtime_) {
         return;
@@ -3781,6 +3934,51 @@ void llama_kvmem_get_tail_mean(uint32_t row, std::vector<float> & state) {
         mem->decode_mean_flush();
         state = mem->raw().mean_checkpoint(row);
     }
+}
+
+llama_kvmem_stash * llama_kvmem_stash_take(uint32_t max_rows, uint32_t * rows) {
+    if (rows) *rows = 0;
+    auto * mem = kvmem_capture_active();
+    if (!mem) return nullptr;
+    try {
+        auto stash = mem->stash_take(max_rows);
+        if (stash && rows) *rows = stash->rows;
+        return stash.release();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return nullptr;
+    }
+}
+
+bool llama_kvmem_stash_put(llama_kvmem_stash * stash) {
+    std::unique_ptr<llama_kvmem_stash> owned(stash);
+    auto * mem = kvmem_capture_active();
+    if (!mem) return false;
+    try {
+        return mem->stash_put(std::move(owned));
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}
+
+bool llama_kvmem_stash_fork(const llama_kvmem_stash * stash, uint32_t rows) {
+    auto * mem = kvmem_capture_active();
+    if (!mem || !stash) return false;
+    try {
+        return mem->stash_fork(*stash, rows);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}
+
+size_t llama_kvmem_stash_bytes(const llama_kvmem_stash * stash) {
+    return stash ? stash->bytes() : 0;
+}
+
+void llama_kvmem_stash_free(llama_kvmem_stash * stash) {
+    delete stash;
 }
 
 void llama_kvmem_set_tail_mean(uint32_t row, const std::vector<float> & state) {

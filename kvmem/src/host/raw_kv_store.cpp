@@ -1125,6 +1125,18 @@ void RawKvStore::truncate_to(uint32_t token_pos) {
     }
 }
 
+std::unique_ptr<RawKvStore> RawKvStore::clone_prefix(uint32_t token_pos) const {
+    if (nvme_) throw std::runtime_error("RawKvStore::clone_prefix does not support NVMe-backed stores");
+    auto out = std::make_unique<RawKvStore>(cfg_);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const size_t keep = cfg_.block_tokens ? (token_pos + cfg_.block_tokens - 1) / cfg_.block_tokens : 0;
+        out->blocks_.assign(blocks_.begin(), blocks_.begin() + (std::ptrdiff_t) std::min(keep, blocks_.size()));
+    }
+    out->truncate_to(token_pos);
+    return out;
+}
+
 void RawKvStore::invalidate_packed_from(uint32_t token_pos) {
     wait_writes();
     std::lock_guard<std::mutex> lk(mu_);

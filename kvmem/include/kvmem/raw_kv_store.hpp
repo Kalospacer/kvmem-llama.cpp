@@ -89,6 +89,8 @@ public:
     void clear();
     // Preserve only the valid prefix, including a partial last block.
     void truncate_to(uint32_t token_pos);
+    // Deep copy of the first token_pos rows. RAM-only stores; throws for NVMe.
+    std::unique_ptr<RawKvStore> clone_prefix(uint32_t token_pos) const;
     void invalidate_packed_from(uint32_t token_pos);
     // In-process tail checkpoint: per layer, valid count followed by the F32 sum.
     std::vector<float> mean_checkpoint(uint32_t token_pos) const;
