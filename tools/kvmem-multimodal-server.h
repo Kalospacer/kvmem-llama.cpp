@@ -1,5 +1,8 @@
 #pragma once
 
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
 #include <set>
 #include <numeric>
 
@@ -62,17 +65,73 @@ static MultimodalCheckpoint multimodal_checkpoint(ServerState & st, int row) {
 
 static void multimodal_remember(ServerState & st, MultimodalCheckpoint checkpoint) {
     auto & entries = st.mm_checkpoints;
+    // Inserting drops everything at or past the new row, so rows stay ascending.
     entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const auto & entry) {
         return entry.row >= checkpoint.row;
     }), entries.end());
     entries.push_back(std::move(checkpoint));
-    if (entries.size() > 4) {
+    const size_t cap = (size_t) std::max(4, st.mm_ckpt_max);
+    const size_t keep_newest = 4;
+    while (entries.size() > cap) {
         const auto media_count = std::count_if(entries.begin(), entries.end(), [](const auto & e) { return e.media_boundary; });
-        auto victim = std::find_if(entries.begin(), entries.end(), [&](const auto & e) {
-            return e.media_boundary == (media_count > 2);
-        });
-        entries.erase(victim == entries.end() ? entries.begin() : victim);
+        const bool evict_media = media_count > 2;
+        // Thin the densest interior region. The oldest entry (system/tool prefix)
+        // and the newest few (recent turns, eval_end, commit) are what the next
+        // turns restore from.
+        size_t victim = entries.size();
+        int best_gap = INT_MAX;
+        for (size_t i = 1; i + keep_newest < entries.size(); ++i) {
+            if (media_count > 0 && entries[i].media_boundary != evict_media) continue;
+            const int gap = entries[i + 1].row - entries[i - 1].row;
+            if (gap < best_gap) {
+                best_gap = gap;
+                victim = i;
+            }
+        }
+        if (victim == entries.size()) {
+            auto it = std::find_if(entries.begin(), entries.end(), [&](const auto & e) {
+                return e.media_boundary == evict_media;
+            });
+            victim = it == entries.end() ? 0 : (size_t) (it - entries.begin());
+        }
+        entries.erase(entries.begin() + (std::ptrdiff_t) victim);
     }
+}
+
+// First-pass rows in (begin, end) that get a recurrent checkpoint: the first
+// message after the system block, message starts within the window before the
+// query, and a fixed interval. Message starts win over nearby interval rows.
+static std::vector<int> multimodal_plan_checkpoints(const ServerState & st, const kvmem_prompt & prompt, int begin, int end) {
+    std::vector<int> rows;
+    const int gap = std::max(1, st.mm_ckpt_min_gap);
+    if (end - begin <= 2 * gap) return rows;
+    std::vector<int> candidates;
+    if (st.mm_msg_token != LLAMA_TOKEN_NULL) {
+        const int window_begin = st.mm_ckpt_window > 0 ? end - st.mm_ckpt_window : end;
+        int seen = 0;
+        for (int row = 0; row < end; ++row) {
+            if (prompt.tokens[row] != st.mm_msg_token) continue;
+            ++seen;
+            if (row > begin && (seen == 2 || row >= window_begin)) candidates.push_back(row);
+        }
+    }
+    const size_t n_messages = candidates.size();
+    if (st.mm_ckpt_interval > 0) {
+        for (int row = (begin / st.mm_ckpt_interval + 1) * st.mm_ckpt_interval; row < end; row += st.mm_ckpt_interval) {
+            candidates.push_back(row);
+        }
+    }
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const int row = candidates[i];
+        if (row - begin < gap || end - row < gap) continue;
+        if (prompt.tokens[row] == LLAMA_TOKEN_NULL) continue; // never split a media chunk
+        const bool crowded = std::any_of(rows.begin(), rows.end(), [&](int kept) { return std::abs(kept - row) < gap; });
+        if (!crowded) rows.push_back(row);
+    }
+    std::sort(rows.begin(), rows.end());
+    kvmem_diag("KVMEM_TRACE prefix_checkpoint_plan span=[%d,%d) message_candidates=%zu planned=%zu\n",
+            begin, end, n_messages, rows.size());
+    return rows;
 }
 
 static void multimodal_restore(ServerState & st, const MultimodalCheckpoint & checkpoint, bool truncate) {
@@ -112,15 +171,27 @@ static void multimodal_finish_request(ServerState & st) {
     if (st.mm_committed || !st.mm_rollback) return;
     try {
         llama_kvmem_set_replay(false);
-        multimodal_restore(st, *st.mm_rollback, true);
+        MultimodalCheckpoint target = *st.mm_rollback;
+        std::shared_ptr<kvmem_prompt> target_prompt = st.mm_rollback_prompt;
+        if (st.mm_keep_aborted && st.active_prompt) {
+            // Entries past the rollback row were all taken by this request on the
+            // active prompt. Keep the newest so a retried prompt resumes there
+            // instead of prefilling from the request start again.
+            for (const auto & checkpoint : st.mm_checkpoints) {
+                if (checkpoint.data && checkpoint.row > target.row && checkpoint.row <= st.mm_live_row) target = checkpoint;
+            }
+            if (target.row > st.mm_rollback->row) target_prompt = st.active_prompt->prefix(target.row);
+        }
+        multimodal_restore(st, target, true);
         llama_kvmem_begin_cached_turn();
         st.mm_query.reset();
         st.mm_pending_query.reset();
-        st.cached_prompt = st.mm_rollback_prompt;
+        st.cached_prompt = target_prompt;
         st.cached_tokens = st.cached_prompt ? st.cached_prompt->tokens : std::vector<llama_token>{};
         st.cached_tokens.resize(std::min(st.cached_tokens.size(), (size_t) st.mm_live_row));
-        multimodal_remember(st, *st.mm_rollback);
-        kvmem_diag("KVMEM_TRACE multimodal_rollback context=%p row=%d\n", (void *) st.ctx, st.mm_live_row);
+        multimodal_remember(st, target);
+        kvmem_diag("KVMEM_TRACE multimodal_rollback context=%p row=%d request_start=%d kept_progress=%d\n",
+                (void *) st.ctx, st.mm_live_row, st.mm_rollback->row, st.mm_live_row - st.mm_rollback->row);
         kvmem_diag("KVMEM_CHECKPOINT_ROLLBACK live_bytes=%zu peak_bytes=%zu\n",
                 st.mm_checkpoint_accounting->live_bytes, st.mm_checkpoint_accounting->peak_bytes);
         st.mm_committed = true;
@@ -132,7 +203,8 @@ static void multimodal_finish_request(ServerState & st) {
     st.mm_rollback_prompt.reset();
 }
 
-static int multimodal_decode_span(ServerState & st, int begin, int end, bool replay, StreamIo * io) {
+static int multimodal_decode_span(ServerState & st, int begin, int end, bool replay, StreamIo * io,
+                                  const std::vector<int> * checkpoint_rows = nullptr) {
     const auto & prompt = *st.active_prompt;
     auto dispatch = [&](llama_batch batch) -> int {
         if (!stream_heartbeat(io)) return KVMEM_DECODE_ABORT;
@@ -175,8 +247,20 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
         return rc;
     };
     int row = begin;
+    // Planned rows split the batches; a checkpoint is taken once a row is reached.
+    size_t next_checkpoint = 0;
+    auto next_checkpoint_row = [&]() {
+        while (checkpoint_rows && next_checkpoint < checkpoint_rows->size() && (*checkpoint_rows)[next_checkpoint] < row) {
+            ++next_checkpoint;
+        }
+        return checkpoint_rows && next_checkpoint < checkpoint_rows->size() ? (*checkpoint_rows)[next_checkpoint] : INT_MAX;
+    };
     while (row < end) {
         if (!stream_heartbeat(io)) return KVMEM_DECODE_ABORT;
+        if (!replay && next_checkpoint_row() == row && row > begin) {
+            multimodal_remember(st, multimodal_checkpoint(st, row));
+            ++next_checkpoint;
+        }
         if (prompt.tokens[row] == LLAMA_TOKEN_NULL) {
             const int next = (int) prompt.media_end(row);
             if (next > end) throw std::runtime_error("prefill boundary splits an image");
@@ -190,7 +274,9 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
             row = next;
             continue;
         }
-        const int limit = std::min(end, row + st.n_batch);
+        int limit = std::min(end, row + st.n_batch);
+        const int planned = next_checkpoint_row();
+        if (planned > row) limit = std::min(limit, planned);
         int next = row;
         while (next < limit && prompt.tokens[next] != LLAMA_TOKEN_NULL) ++next;
         std::vector<llama_pos> pos(next - row), logical(next - row);
@@ -261,6 +347,13 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
             memory_clear_all(st);
             st.mm_lcp = 0; // No old rows survived the reset; count all evaluated rows as new.
             base = multimodal_checkpoint(st, 0);
+        } else {
+            // Checkpoints past the common prefix were computed on the abandoned branch.
+            const size_t before = st.mm_checkpoints.size();
+            st.mm_checkpoints.erase(std::remove_if(st.mm_checkpoints.begin(), st.mm_checkpoints.end(),
+                    [&](const auto & checkpoint) { return checkpoint.row > lcp; }), st.mm_checkpoints.end());
+            kvmem_diag("KVMEM_TRACE prefix_checkpoint_reuse base=%d lcp=%d keep=%d catchup=%d dropped=%zu kept=%zu\n",
+                    base.row, lcp, keep, keep - base.row, before - st.mm_checkpoints.size(), st.mm_checkpoints.size());
         }
         st.mm_rollback = std::make_shared<MultimodalCheckpoint>(base);
         st.mm_rollback_prompt = st.cached_prompt ? st.cached_prompt->prefix(base.row) : nullptr;
@@ -353,7 +446,8 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
         }
         if (all_resident) llama_kvmem_keep_selected();
         if (n_cache_hit) *n_cache_hit = base.row;
-        if (multimodal_decode_span(st, base.row, query, false, io) != 0) throw std::runtime_error("multimodal prefill failed or cancelled");
+        const auto checkpoint_rows = multimodal_plan_checkpoints(st, prompt, base.row, query);
+        if (multimodal_decode_span(st, base.row, query, false, io, &checkpoint_rows) != 0) throw std::runtime_error("multimodal prefill failed or cancelled");
         auto query_checkpoint = multimodal_checkpoint(st, query);
         multimodal_remember(st, query_checkpoint);
         const auto probe_view = llama_kvmem_get_attention_view();

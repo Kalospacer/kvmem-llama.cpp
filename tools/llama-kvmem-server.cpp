@@ -116,6 +116,12 @@ static void print_usage(const char * argv0) {
             "  --kvmem-query-replay MODE  legacy or auto (default auto)\n"
             "  --kvmem-query-policy MODE  legacy or user (default user)\n"
             "  --kvmem-mtp-state MODE     snapshots, auto or replay (default replay with MTP)\n"
+            "  --kvmem-ckpt-max N         recurrent prefix checkpoints kept in host RAM (default 24, min 4)\n"
+            "  --kvmem-ckpt-interval N    first-pass checkpoint every N rows (default 4096, 0 = off)\n"
+            "  --kvmem-ckpt-window N      checkpoint message starts within N rows before the query (default 8192, 0 = off)\n"
+            "  --kvmem-ckpt-min-gap N     minimum rows between first-pass checkpoints (default 256)\n"
+            "  --no-kvmem-keep-aborted    on cancel/failure roll back to the request start instead of\n"
+            "                            the newest checkpoint of the aborted prefill\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe file in GiB (0 = off)\n"
@@ -259,6 +265,15 @@ struct ServerState {
     uint32_t mm_replayed = 0;
     uint32_t mm_tail_replayed = 0;
     int mm_lcp = 0;
+    // Partial prefix reuse: extra GDN checkpoints taken during the first pass at
+    // message boundaries and fixed intervals, so a prompt that diverges early
+    // (rewritten turn tail, stripped thinking) restores near the divergence.
+    int mm_ckpt_max = 24;
+    int mm_ckpt_interval = 4096;
+    int mm_ckpt_window = 8192;
+    int mm_ckpt_min_gap = 256;
+    bool mm_keep_aborted = true;
+    llama_token mm_msg_token = LLAMA_TOKEN_NULL;
     std::string mm_error;
     int mm_error_status = 500;
     bool mm_reset_requested = false;
@@ -1679,6 +1694,32 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             st.kparams.mtp_state = mode == "replay" ? 2 : mode == "auto" ? 1 : 0;
+        } else if (eq(arg, "--kvmem-ckpt-max")) {
+            st.mm_ckpt_max = kvmem_cli_int(arg, need(arg));
+            if (st.mm_ckpt_max < 4) {
+                fprintf(stderr, "invalid --kvmem-ckpt-max (want >= 4)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-ckpt-interval")) {
+            st.mm_ckpt_interval = kvmem_cli_int(arg, need(arg));
+            if (st.mm_ckpt_interval < 0) {
+                fprintf(stderr, "invalid --kvmem-ckpt-interval (want >= 0)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-ckpt-window")) {
+            st.mm_ckpt_window = kvmem_cli_int(arg, need(arg));
+            if (st.mm_ckpt_window < 0) {
+                fprintf(stderr, "invalid --kvmem-ckpt-window (want >= 0)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-ckpt-min-gap")) {
+            st.mm_ckpt_min_gap = kvmem_cli_int(arg, need(arg));
+            if (st.mm_ckpt_min_gap < 1) {
+                fprintf(stderr, "invalid --kvmem-ckpt-min-gap (want >= 1)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--no-kvmem-keep-aborted")) {
+            st.mm_keep_aborted = false;
         } else if (eq(arg, "--kvmem-query-max-tokens")) {
             st.query_max_tokens = kvmem_cli_int(arg, need(arg));
             if (st.query_max_tokens <= 0) {
@@ -1926,6 +1967,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
     st.vocab = llama_model_get_vocab(st.model);
+    {
+        // ChatML message delimiter; message starts are cheap, high-value checkpoint rows.
+        const auto ids = tokenize_text(st.vocab, "<|im_start|>", false);
+        st.mm_msg_token = ids.size() == 1 ? ids[0] : LLAMA_TOKEN_NULL;
+        LOG_INF("srv    prefix checkpoints: max=%d interval=%d window=%d min_gap=%d keep_aborted=%d msg_token=%d\n",
+                st.mm_ckpt_max, st.mm_ckpt_interval, st.mm_ckpt_window, st.mm_ckpt_min_gap,
+                (int) st.mm_keep_aborted, (int) st.mm_msg_token);
+    }
     try {
         st.tmpls = common_chat_templates_init(st.model, chat_template);
     } catch (const std::exception & e) {
