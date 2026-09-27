@@ -277,6 +277,8 @@ static void check_batch_inputs(llama_model * model) {
     std::puts("PASS visual batch split: logical rows, M-RoPE, separate hidden input");
 }
 
+#include "kvmem-harvest-boundary-test.h"
+
 static void check_replay_logits(llama_model * model, ggml_type type, int mtp_state = 0, ggml_type type_v = GGML_TYPE_COUNT) {
     llama_kvmem_params kp{};
     kp.enabled = true;
@@ -519,8 +521,9 @@ static void check_gdn_transactions(llama_model * model, ggml_type type, int draf
 
 int main(int argc, char ** argv) {
     const bool target_only = argc == 3 && std::string(argv[2]) == "--target-only";
-    if (argc != 2 && !target_only) {
-        std::fprintf(stderr, "Usage: %s model.gguf [--target-only] (requires CUDA; full suite requires Qwen 27B MTP weights)\n", argv[0]);
+    const bool boundary_only = argc == 3 && std::string(argv[2]) == "--harvest-boundary-only";
+    if (argc != 2 && !target_only && !boundary_only) {
+        std::fprintf(stderr, "Usage: %s model.gguf [--target-only|--harvest-boundary-only] (requires CUDA; full suite requires Qwen 27B MTP weights)\n", argv[0]);
         return argc == 1 ? 77 : 1;
     }
     try {
@@ -528,10 +531,17 @@ int main(int argc, char ** argv) {
         ggml_backend_load_all();
         auto mp = llama_model_default_params();
         mp.n_gpu_layers = 99;
-        mp.load_mtp = !target_only;
+        mp.load_mtp = !target_only && !boundary_only;
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
                 llama_model_load_from_file(argv[1], mp), llama_model_free);
         require(bool(model), "model load failed");
+        check_harvest_boundary(model.get());
+        if (boundary_only) {
+            llama_kvmem_set_params(nullptr);
+            model.reset();
+            llama_backend_free();
+            return 0;
+        }
         check_batch_inputs(model.get());
 
         llama_kvmem_params kp{};

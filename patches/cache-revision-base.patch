@@ -517,7 +517,7 @@ diff --git a/include/llama.h b/include/llama.h
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -63,6 +63,47 @@
+@@ -63,6 +63,41 @@
  
  target_link_libraries(llama PUBLIC ggml)
  
@@ -531,12 +531,6 @@ diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 +        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem-mtp.cpp
 +        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-batch.cpp
 +        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-capture.cpp
-+        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-pic-capture.cpp
-+        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-pic-math.cpp
-+        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-pic-state.cpp
-+        ${LLAMA_KVMEM_ROOT}/src/adapter/pic-rope.cpp
-+        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-pic-kv.cpp
-+        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-pic-store.cpp
 +    )
 +    if (GGML_CUDA)
 +        enable_language(CUDA)
@@ -551,7 +545,7 @@ diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 +        ${LLAMA_KVMEM_ROOT}/src/adapter
 +        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src
 +    )
-+    target_compile_definitions(llama PRIVATE LLAMA_KVMEM=1 LLAMA_KVMEM_PIC_CAPTURE=1)
++    target_compile_definitions(llama PRIVATE LLAMA_KVMEM=1)
 +    if (NOT TARGET kvmem)
 +        add_subdirectory(${LLAMA_KVMEM_ROOT}/kvmem ${CMAKE_BINARY_DIR}/kvmem-from-llama)
 +    endif()
@@ -647,21 +641,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
  
      // TODO: more generic
      if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-@@ -1331,6 +1340,13 @@
- }
- 
- llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-+#if defined(LLAMA_KVMEM)
-+    if (mctx && !llama_kvmem_before_ubatch(sched.get(), ubatch.n_tokens,
-+            ubatch.logical_pos ? ubatch.logical_pos : ubatch.pos, gtype == LLM_GRAPH_TYPE_DECODER_MTP)) {
-+        ret = GGML_STATUS_FAILED;
-+        return nullptr;
-+    }
-+#endif
-     if (mctx && !mctx->apply()) {
-         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-         ret = GGML_STATUS_FAILED;
-@@ -1344,7 +1360,12 @@
+@@ -1344,7 +1353,12 @@
      // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
      const auto gparams = graph_params(res, ubatch, mctx, gtype);
  
@@ -675,7 +655,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
          //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
  
          // with pipeline parallelism, the previous graph_compute_async may still be running
-@@ -1363,6 +1384,9 @@
+@@ -1363,6 +1377,9 @@
  
          //const auto t_start_us = ggml_time_us();
  
@@ -685,7 +665,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
          gf = model.build_graph(gparams);
  
          //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-@@ -1396,6 +1420,10 @@
+@@ -1396,6 +1413,10 @@
          ret = status;
          return nullptr;
      }
@@ -1088,7 +1068,7 @@ diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
-@@ -25,15 +25,26 @@
+@@ -25,14 +25,19 @@
                   uint32_t   mem_size,
                   uint32_t   n_seq_max,
                   uint32_t   n_rs_seq,
@@ -1108,16 +1088,9 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
 +                type_r == GGML_TYPE_F32 && type_s == GGML_TYPE_F32 && hparams.ssm_d_inner == 6144 &&
 +                hparams.ssm_d_state == 128 && hparams.ssm_n_group == 16 && hparams.ssm_dt_rank == 48 && hparams.ssm_d_conv == 4));
      rs_idx.assign(n_seq_max, 0);
-+    rollback_floor.assign(n_seq_max, -1);
-+    pic_state_qwen48 = (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
-+                       model.arch == LLM_ARCH_QWEN3NEXT) &&
-+        hparams.ssm_d_inner == 6144 && hparams.ssm_d_state == 128 &&
-+        hparams.ssm_n_group == 16 && hparams.ssm_dt_rank == 48 && hparams.ssm_d_conv == 4 &&
-+        hparams.ple_conv_state() == 0;
  
      cells.clear();
-     cells.resize(mem_size);
-@@ -52,7 +63,7 @@
+@@ -52,7 +57,7 @@
          if (it == ctx_map.end()) {
              ggml_init_params params = {
                  // r and s per layer, plus the separate PLE conv row where the model has one
@@ -1126,7 +1099,7 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
                  /*.mem_buffer =*/ NULL,
                  /*.no_alloc   =*/ true,
              };
-@@ -73,6 +84,7 @@
+@@ -73,6 +78,7 @@
      r_l.resize(n_layer);
      s_l.resize(n_layer);
      p_l.resize(n_layer);
@@ -1134,7 +1107,7 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
  
      for (int i = 0; i < n_layer; i++) {
          if (filter && !filter(i)) {
-@@ -98,7 +110,7 @@
+@@ -98,7 +104,7 @@
              throw std::runtime_error("failed to create ggml context for rs cache");
          }
  
@@ -1143,7 +1116,7 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
          ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
          ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
          ggml_format_name(r, "cache_r_l%d", i);
-@@ -106,6 +118,15 @@
+@@ -106,6 +112,15 @@
          r_l[i] = r;
          s_l[i] = s;
  
@@ -1159,7 +1132,7 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
          // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
          if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
              ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows);
-@@ -131,7 +152,7 @@
+@@ -131,7 +146,7 @@
          const size_t memory_size_p = size_p_bytes();
  
          LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
@@ -1168,7 +1141,7 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
                  ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                  ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                  ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
-@@ -139,6 +160,9 @@
+@@ -139,6 +154,9 @@
  }
  
  void llama_memory_recurrent::clear(bool data) {
@@ -1178,133 +1151,20 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
      for (int32_t i = 0; i < (int32_t) size; ++i) {
          cells[i].pos = -1;
          cells[i].seq_id.clear();
-@@ -156,6 +180,7 @@
-     }
- 
-     std::fill(rs_idx.begin(), rs_idx.end(), 0);
-+    std::fill(rollback_floor.begin(), rollback_floor.end(), -1);
- }
- 
- bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-@@ -169,7 +194,7 @@
-         p1 = std::numeric_limits<llama_pos>::max();
-     }
- 
--    if ((uint32_t) seq_id >= this->n_seq_max) {
-+    if (seq_id >= 0 && (uint32_t) seq_id >= this->n_seq_max) {
-         LLAMA_LOG_ERROR("%s: invalid seq_id (%d) - larger than n_seq_max (%d)\n", __func__, seq_id, this->n_seq_max);
-         return false;
-     }
-@@ -177,6 +202,12 @@
-     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
-     if (rm_all) {
-         set_rs_idx(seq_id, 0);
-+        if (seq_id < 0) {
-+            std::fill(rollback_floor.begin(), rollback_floor.end(), -1);
-+            for (auto & cell : cells) cell.tail = -1;
-+        } else {
-+            rollback_floor[seq_id] = -1;
-+        }
-     }
- 
-     // models like Mamba or RWKV can't have a state partially erased at the end
-@@ -192,6 +223,9 @@
- 
-             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
-             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-+                if (replay_recording || replay_poisoned || p0 - 1 < rollback_floor[seq_id]) {
-+                    return false;
-+                }
-                 const llama_pos rollback = cell.pos - (p0 - 1);
-                 // pending rollback is single-use
-                 const bool pending = rs_idx[seq_id] != 0;
-@@ -205,6 +239,8 @@
-             // invalidate tails which will be cleared
-             if (p0 <= cell.pos && cell.pos < p1) {
-                 tail_id = -1;
-+                rollback_floor[seq_id] = -1;
-+                set_rs_idx(seq_id, 0);
-             }
-         }
-     } else {
-@@ -259,7 +295,10 @@
-         p1 = std::numeric_limits<llama_pos>::max();
-     }
- 
--    if ((uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size) {
-+    if ((uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size &&
-+            (uint32_t) seq_id_dst < n_seq_max && (uint32_t) seq_id_src < n_seq_max) {
-+        rollback_floor[seq_id_dst] = rollback_floor[seq_id_src];
-+        rs_idx[seq_id_dst] = rs_idx[seq_id_src];
-         auto & tail_src = cells[seq_id_src];
-         auto & tail_dst = cells[seq_id_dst];
-         if (tail_dst.tail >= 0) {
-@@ -285,6 +324,13 @@
- 
- void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
-     uint32_t new_head = size;
-+
-+    for (size_t i = 0; i < rollback_floor.size(); ++i) {
-+        if ((llama_seq_id) i != seq_id) {
-+            rollback_floor[i] = -1;
-+            rs_idx[i] = 0;
-+        }
-+    }
- 
-     for (uint32_t i = 0; i < size; ++i) {
-         if ((llama_seq_id) i != seq_id) {
-@@ -340,6 +386,7 @@
-             auto & cell = cells[tail_id];
-             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
-                 cell.pos += shift;
-+                for (const auto id : cell.seq_id) rollback_floor[id] = cell.pos;
-             }
-         }
-     }
-@@ -370,6 +417,7 @@
-             auto & cell = cells[tail_id];
-             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
-                 cell.pos /= d;
-+                for (const auto id : cell.seq_id) rollback_floor[id] = cell.pos;
-             }
-         }
-     }
-@@ -479,11 +527,18 @@
+@@ -479,6 +497,12 @@
  }
  
  bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches) {
-+    if (replay_poisoned || (replay_capacity && replay_recording &&
++    if (replay_capacity && (replay_poisoned || (replay_recording &&
 +            (ubatches.size() != 1 || ubatches[0].n_tokens != replay_width ||
-+             !ubatches[0].pos || ubatches[0].pos[0] != replay_start))) {
++             !ubatches[0].pos || ubatches[0].pos[0] != replay_start)))) {
 +        LLAMA_LOG_ERROR("%s: invalid GDN replay state or verification batch\n", __func__);
 +        return false;
 +    }
      // simply remember the full state because it is very small for this type of cache
      // TODO: optimize
      auto org_cells = cells;
-     auto org_used = used;
-     auto org_head = head;
-+    auto org_floor = rollback_floor;
- 
-     bool success = true;
- 
-@@ -498,6 +553,7 @@
-     cells = std::move(org_cells);
-     used = org_used;
-     head = org_head;
-+    rollback_floor = std::move(org_floor);
- 
-     return success;
- }
-@@ -668,6 +724,7 @@
-             const llama_seq_id seq_id = ubatch.seq_id[i][j];
-             cell.seq_id.insert(seq_id);
-             cells[seq_id].tail = cell_id;
-+            rollback_floor[seq_id] = rollback_floor[ubatch.seq_id[i][0]];
-         }
-     }
- 
-@@ -765,6 +822,9 @@
+@@ -765,6 +789,9 @@
  
  void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
      GGML_UNUSED(flags);
@@ -1314,83 +1174,25 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
  
      std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
      std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
-@@ -846,15 +906,15 @@
+@@ -846,6 +873,9 @@
  
  void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
      GGML_UNUSED(flags);
--
--    uint32_t cell_count;
--    io.read(&cell_count, sizeof(cell_count));
--
 +    replay_recording = false;
 +    replay_cells.clear();
 +    replay_poisoned = true;
-+
-+    uint32_t cell_count = 0;
-     bool res = true;
--
--    res = res && state_read_meta(io, cell_count, seq_id);
--
-     try {
-+        io.read(&cell_count, sizeof(cell_count));
-+        res = state_read_meta(io, cell_count, seq_id);
-         res = res && state_read_data(io, cell_count);
-     } catch (...) {
-         res = false;
-@@ -867,12 +927,22 @@
-         } else {
-             seq_rm(seq_id, -1, -1);
-         }
-+        replay_poisoned = true;
-         throw std::runtime_error("failed to restore kv cache");
-     }
  
+     uint32_t cell_count;
+     io.read(&cell_count, sizeof(cell_count));
+@@ -873,6 +903,7 @@
      if (n_rs_seq != 0) {
          set_rs_idx(seq_id, 0);
      }
-+    // The snapshot contains one current row, not historical rollback planes.
-+    for (size_t id = 0; id < rollback_floor.size(); ++id) {
-+        if (seq_id >= 0 && (llama_seq_id) id != seq_id) continue;
-+        rollback_floor[id] = seq_pos_max((llama_seq_id) id);
-+    }
-+    replay_start = -1;
-+    replay_width = replay_head = replay_used = replay_n = 0;
-+    replay_rs_z = -1;
 +    replay_poisoned = false;
  }
  
  void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
-@@ -992,7 +1062,7 @@
- bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id) {
-     if (dest_seq_id != -1) {
-         // single sequence
--        seq_rm(dest_seq_id, -1, -1);
-+        if (!seq_rm(dest_seq_id, -1, -1)) return false;
- 
-         if (cell_count == 0) {
-             return true;
-@@ -1040,6 +1110,7 @@
-         }
- 
-         clear(true);
-+        replay_poisoned = true;
- 
-         for (uint32_t i = 0; i < cell_count; ++i) {
-             auto & cell = cells[i];
-@@ -1080,7 +1151,11 @@
-         uint32_t cell_id = head + i;
-         // make sure the recurrent states will keep their restored state
-         cells[cell_id].src = cell_id;
--    }
-+        cells[cell_id].src0 = cell_id;
-+    }
-+
-+    n = cell_count;
-+    rs_z = -1;
- 
-     return true;
- }
-@@ -1291,6 +1366,48 @@
+@@ -1291,6 +1322,48 @@
      return mem->size;
  }
  
@@ -1460,10 +1262,11 @@ diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
  
      ~llama_memory_recurrent() = default;
  
-@@ -73,8 +75,21 @@
+@@ -72,6 +74,14 @@
+ 
      // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
      uint32_t n_rs_seq = 0;
- 
++
 +    enum replay_kind { REPLAY_K, REPLAY_V, REPLAY_G, REPLAY_B, REPLAY_CONV, REPLAY_COUNT };
 +    uint32_t replay_capacity = 0;
 +    bool replay_recording = false;
@@ -1471,18 +1274,10 @@ diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
 +    std::vector<std::array<ggml_tensor *, REPLAY_COUNT>> replay_l;
 +    bool replay_begin(llama_pos start, uint32_t width);
 +    void replay_finish(uint32_t n_keep);
-+
+ 
      // per-seq rollback index
      std::vector<uint32_t> rs_idx;
-+
-+    // Lowest valid tail position after loading only the current state plane.
-+    std::vector<llama_pos> rollback_floor;
-+
-+    bool supports_pic_state() const { return pic_state_qwen48; }
- 
-     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
- 
-@@ -108,6 +123,11 @@
+@@ -108,6 +118,11 @@
  
      std::vector<mem_cell> cells;
  
@@ -1494,15 +1289,7 @@ diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
      // per layer
      std::vector<ggml_tensor *> r_l;
      std::vector<ggml_tensor *> s_l;
-@@ -115,6 +135,7 @@
-     std::vector<ggml_tensor *> p_l;
- 
- private:
-+    bool pic_state_qwen48 = false;
-     //const llama_model & model;
-     const llama_hparams & hparams;
- 
-@@ -170,6 +191,9 @@
+@@ -170,6 +185,9 @@
      uint32_t get_head() const;
      int32_t  get_rs_z() const;
      uint32_t get_size() const;
@@ -1641,69 +1428,7 @@ diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
-@@ -1,5 +1,9 @@
- #include "models.h"
- #include "llama-memory-recurrent.h"
-+
-+#if defined(LLAMA_KVMEM) && defined(LLAMA_KVMEM_PIC_CAPTURE)
-+#include "llama-kvmem-pic-capture.h"
-+#endif
- 
- void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
-     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
-@@ -132,6 +136,11 @@
- 
- llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_params & params) :
-     llm_build_delta_net_base(params), model(model) {
-+#if defined(LLAMA_KVMEM) && defined(LLAMA_KVMEM_PIC_CAPTURE)
-+    const bool pic_capture = llama_kvmem_pic_capture_enabled(cparams);
-+#else
-+    constexpr bool pic_capture = false;
-+#endif
-     const int64_t n_embd_head = hparams.n_embd_head_v();
- 
-     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-@@ -171,7 +180,7 @@
-             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
-         }
- 
--        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
-+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked && !pic_capture) {
-             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
-             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
-         }
-@@ -205,6 +214,13 @@
- 
-     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
- 
-+#if defined(LLAMA_KVMEM) && defined(LLAMA_KVMEM_PIC_CAPTURE)
-+    llama_kvmem_pic_capture_tensor(ctx0, gf, cparams, cur, llama_kvmem_pic_field::target_hidden, -1);
-+#endif
-+    if (pic_capture && cparams.embeddings_nextn_masked && inp_out_ids) {
-+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-+    }
-+
-     cb(cur, "h_nextn", -1);
-     res->t_h_nextn = cur;
- 
-@@ -222,6 +238,16 @@
-     res->t_logits = cur;
- 
-     ggml_build_forward_expand(gf, cur);
-+
-+#if defined(LLAMA_KVMEM) && defined(LLAMA_KVMEM_PIC_CAPTURE)
-+    std::vector<int32_t> pic_layers;
-+    for (int il = 0; il < n_layer; ++il) {
-+        if (hparams.is_recr(il)) {
-+            pic_layers.push_back(il);
-+        }
-+    }
-+    llama_kvmem_pic_capture_attach(res, cparams, pic_layers);
-+#endif
- }
- 
- std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
-@@ -275,6 +301,8 @@
+@@ -275,6 +275,8 @@
      Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
      cb(Qcur, "Qcur_normed", il);
  
@@ -1712,7 +1437,7 @@ diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
      ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
      cb(Kcur, "Kcur", il);
  
-@@ -285,6 +313,8 @@
+@@ -285,6 +287,8 @@
      Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
      Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
      cb(Kcur, "Kcur_normed", il);
@@ -1721,7 +1446,7 @@ diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
  
      ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
          ggml_element_size(Qcur_full) * n_embd_head * 2,
-@@ -311,6 +341,7 @@
+@@ -311,6 +315,7 @@
      cb(Qcur, "Qcur", il);
      cb(Kcur, "Kcur", il);
      cb(Vcur, "Vcur", il);
@@ -1729,32 +1454,7 @@ diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
  
      // Attention computation
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
-@@ -384,6 +415,10 @@
- 
-     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
- 
-+#if defined(LLAMA_KVMEM) && defined(LLAMA_KVMEM_PIC_CAPTURE)
-+    llama_kvmem_pic_capture_tensor(ctx0, gf, cparams, conv_input, llama_kvmem_pic_field::conv_input, il);
-+#endif
-+
-     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-     cb(state, "state_predelta", il);
-@@ -443,6 +478,13 @@
-     cb(q_conv, "q_conv_predelta", il);
-     cb(k_conv, "k_conv_predelta", il);
-     cb(v_conv, "v_conv_predelta", il);
-+
-+#if defined(LLAMA_KVMEM) && defined(LLAMA_KVMEM_PIC_CAPTURE)
-+    llama_kvmem_pic_capture_tensor(ctx0, gf, cparams, k_conv, llama_kvmem_pic_field::k_conv, il);
-+    llama_kvmem_pic_capture_tensor(ctx0, gf, cparams, v_conv, llama_kvmem_pic_field::v_conv, il);
-+    llama_kvmem_pic_capture_tensor(ctx0, gf, cparams, gate,   llama_kvmem_pic_field::gate, il);
-+    llama_kvmem_pic_capture_tensor(ctx0, gf, cparams, beta,   llama_kvmem_pic_field::beta, il);
-+#endif
- 
-     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
- 
-@@ -576,10 +618,12 @@
+@@ -576,10 +581,12 @@
      Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
      Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
      cb(Kcur, "mtp_Kcur_normed", il);

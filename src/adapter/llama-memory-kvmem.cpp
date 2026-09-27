@@ -38,6 +38,8 @@
 #include <thread>
 
 static llama_kvmem_params g_kvmem_params = {};
+static std::atomic<bool> g_kvmem_pool_copy_cow{true};
+static std::atomic<bool> g_kvmem_pool_gpu_reuse{false};
 
 struct llama_memory_kvmem::GdnReplay {
     ggml_backend_buffer_ptr descriptors;
@@ -962,6 +964,9 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         return false;
     }
 
+    // Non-identity layout writes several destinations, including cycles.
+    // Same-slot tags are only republished after a later completed harvest.
+    drop_resident_tags();
     ++attention_epoch_;
     std::vector<uint8_t> mtp_res(items.size(), 0);
     bool mtp_d2d_ok = false;
@@ -1346,6 +1351,14 @@ bool llama_memory_kvmem::prepare_ubatches(
         const std::vector<llama_ubatch> & ubatches,
         uint32_t n_new_tokens,
         llama_kv_cache::slot_info_vec_t & sinfos) {
+    if (gpu_reuse_requested()) {
+        // Pressure can harvest before the first ubatch hook. Finish the prior
+        // batch's graphs before planning any synchronous stage-out.
+        if (kvmem_cuda_tensor_ptr(kv_->get_k_storage(kvmem_first_attn_layer(model_))) &&
+                cudaDeviceSynchronize() != cudaSuccess) return false;
+        harvest_flush();
+        harvest_gpu_v_commit();
+    }
     const uint32_t old_rows = store_n_tokens();
     for (const auto & ub : ubatches) {
         for (uint32_t i = 0; i < ub.n_tokens; ++i) {
@@ -1422,18 +1435,23 @@ llama_memory_context_ptr llama_memory_kvmem::init_batch(
 }
 
 llama_memory_context_ptr llama_memory_kvmem::init_full() {
+    note_external_kv_write();
     return kv_->init_full();
 }
 
 llama_memory_context_ptr llama_memory_kvmem::init_update(llama_context * lctx, bool optimize) {
-    return kv_->init_update(lctx, optimize);
+    auto update = kv_->init_update(lctx, optimize);
+    if (update->get_status() != LLAMA_MEMORY_STATUS_NO_UPDATE) note_external_kv_write();
+    return update;
 }
 
 void llama_memory_kvmem::clear(bool data) {
     harvest_flush();
     harvest_gpu_v_commit();
+    const bool preserve = preserving_gpu_contents();
+    if (!preserve) pool_preserve_end(false);
     if (kv_) {
-        kv_->clear(data);
+        kv_->clear(data && !preserve);
     }
     reset_policy();
 }
@@ -1457,6 +1475,7 @@ bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
 }
 
 void llama_memory_kvmem::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    note_external_kv_write();
     ++attention_epoch_;
     kv_->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
@@ -1467,11 +1486,13 @@ void llama_memory_kvmem::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_kvmem::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    note_external_kv_write();
     ++attention_epoch_;
     kv_->seq_add(seq_id, p0, p1, shift);
 }
 
 void llama_memory_kvmem::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    note_external_kv_write();
     ++attention_epoch_;
     kv_->seq_div(seq_id, p0, p1, d);
 }
@@ -1493,12 +1514,35 @@ void llama_memory_kvmem::state_write(llama_io_write_i & io, llama_seq_id seq_id,
 }
 
 void llama_memory_kvmem::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    note_external_kv_write();
     ++attention_epoch_;
     kv_->state_read(io, seq_id, flags);
 }
 
 void llama_memory_kvmem::note_ubatch_pos(const std::vector<llama_pos> & pos) {
     pos_queue_.push_back(pos);
+}
+
+bool llama_memory_kvmem::gpu_reuse_requested() const {
+    return g_kvmem_pool_gpu_reuse.load(std::memory_order_relaxed);
+}
+
+bool llama_memory_kvmem::before_ubatch(uint32_t n, const llama_pos * rows) {
+    if (!gpu_reuse_requested()) return true;
+    if (!rows || !runtime_ || !raw_) return false;
+    // Old D2H/worker writes must finish BEFORE invalidating packed validity.
+    // Otherwise an old snapshot can republish validity after this graph writes.
+    harvest_flush();
+    harvest_gpu_v_commit();
+    for (uint32_t i = 0; i < n; ++i) {
+        if (rows[i] < 0 || uint32_t(rows[i]) >= store_n_tokens()) return false;
+        const uint32_t row = uint32_t(rows[i]);
+        const auto & b = store().blocks()[row / block_tokens_];
+        if (b.gpu_slot < 0) return false;
+        note_gpu_write(b.gpu_slot);
+        raw_->invalidate_packed_block(b.block_id, row % block_tokens_);
+    }
+    return true;
 }
 
 void llama_memory_kvmem::register_capture(ggml_tensor * t, int il, char which) {
@@ -2331,11 +2375,7 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
     if (blk.gpu_slot < 0 || blk.n_tokens == 0) {
         return;
     }
-    const llama_kv_cells & cells = kv_->get_cells(0);
-    const uint32_t idx = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_;
-    if (idx >= cells.size() || cells.is_empty(idx)) {
-        return;
-    }
+    if (!gpu_kv_complete(block_id, kv_)) return;
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
     const uint32_t nt = blk.n_tokens;
@@ -2417,6 +2457,10 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
 }
 
 void llama_memory_kvmem::harvest_full_blocks_async() {
+    // Runtime block lengths cover the ENTIRE batch, while compute has only
+    // completed one ubatch. In reuse mode harvest at fenced stash/pressure/
+    // retrieval boundaries instead; do not publish an occupied but unwritten tail.
+    if (gpu_reuse_requested()) return;
     if (retrieval_pinned_ || replay_ || v_trans_ || !raw_ || !kv_ || !runtime_) {
         return;
     }
@@ -2733,6 +2777,7 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
     if (blk.gpu_slot < 0 || !raw_->has_block(block_id)) {
         return;
     }
+    note_gpu_write(blk.gpu_slot);
     ++attention_epoch_;
     occupy_block_cells(block_id);
     const uint32_t nt = blk.n_tokens;
@@ -2834,6 +2879,7 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
     if (!host || !kv_ || gpu_slot < 0 || bytes == 0) {
         return;
     }
+    note_gpu_write(gpu_slot);
     (void) block_id;
     const auto * src = static_cast<const uint8_t *>(host);
     uint64_t off = 0;
@@ -3261,6 +3307,398 @@ void llama_memory_kvmem::apply_selection(const llama_kvmem_selection & selection
         retr_.total_us += ggml_time_us() - t_all;
         retr_perf_print();
     }
+}
+
+bool llama_kvmem_stash::truncate_to(uint32_t prefix_rows) {
+    if (!runtime || !raw || prefix_rows == 0 || prefix_rows > rows ||
+            runtime->store().total_tokens() < prefix_rows || row_positions.size() < prefix_rows) {
+        return false;
+    }
+    // Detached runtimes share the live backend. Never let truncate free a live
+    // slot through it, even if a malformed stash reaches this entry point.
+    for (const auto & b : runtime->store().blocks()) {
+        if (b.gpu_slot >= 0) return false;
+    }
+    runtime->truncate_to(prefix_rows);
+    raw->truncate_to(prefix_rows);
+    if (mtp_raw) mtp_raw->truncate_to(prefix_rows);
+    row_positions.resize(prefix_rows);
+    const uint32_t n_blocks = runtime->store().block_count();
+    resident.erase(std::remove_if(resident.begin(), resident.end(),
+            [n_blocks](uint32_t id) { return id >= n_blocks; }), resident.end());
+    rows = prefix_rows;
+    return true;
+}
+
+size_t llama_kvmem_stash::bytes() const {
+    size_t n = row_positions.size() * sizeof(row_positions[0]);
+    if (raw) n += raw->bytes_k() + raw->bytes_v();
+    if (mtp_raw) n += mtp_raw->bytes_k() + mtp_raw->bytes_v();
+    return n;
+}
+
+static void kvmem_runtime_allocations(const kvmem::KvMemRuntime * runtime,
+                                     std::vector<std::pair<const void *, size_t>> & out) {
+    if (!runtime) return;
+    out.emplace_back(runtime, sizeof(*runtime));
+    const auto & blocks = runtime->store().blocks();
+    if (blocks.capacity()) out.emplace_back(blocks.data(), blocks.capacity() * sizeof(blocks[0]));
+}
+
+void llama_kvmem_stash::append_allocations(std::vector<std::pair<const void *, size_t>> & out) const {
+    out.emplace_back(this, sizeof(*this));
+    if (raw) raw->append_allocations(out);
+    if (mtp_raw) mtp_raw->append_allocations(out);
+    if (row_positions.capacity()) out.emplace_back(row_positions.data(), row_positions.capacity() * sizeof(row_positions[0]));
+    if (resident.capacity()) out.emplace_back(resident.data(), resident.capacity() * sizeof(resident[0]));
+    kvmem_runtime_allocations(runtime.get(), out);
+}
+
+void llama_memory_kvmem::append_allocations(std::vector<std::pair<const void *, size_t>> & out) {
+    harvest_flush();
+    harvest_gpu_v_commit();
+    if (mtp_) mtp_->harvest_flush();
+    if (raw_) raw_->append_allocations(out);
+    if (mtp_) mtp_->raw().append_allocations(out);
+    if (row_positions_.capacity()) out.emplace_back(row_positions_.data(), row_positions_.capacity() * sizeof(row_positions_[0]));
+    kvmem_runtime_allocations(runtime_.get(), out);
+    resident_tags_.append_allocations(out);
+}
+
+bool llama_memory_kvmem::gpu_reuse_supported() const {
+    if (!g_kvmem_pool_gpu_reuse.load(std::memory_order_relaxed) || !runtime_ || !raw_ || !kv_ ||
+            v_trans_ || raw_->nvme_enabled() || runtime_->config().cpu_bytes || runtime_->config().nvme_bytes) return false;
+    for (uint32_t il : kv_->get_layer_ids()) {
+        if (il >= n_layer_) continue;
+        if (!kvmem_cuda_tensor_ptr(kv_->get_k_storage(il)) || !kvmem_cuda_tensor_ptr(kv_->get_v_storage(il))) return false;
+    }
+    if (mtp_) {
+        if (!mtp_->can_stash() || mtp_->v_trans_ || mtp_->raw().config().n_layer != 1) return false;
+        if (!kvmem_cuda_tensor_ptr(mtp_->get_kv()->get_k_storage(mtp_->il_graph_)) ||
+                !kvmem_cuda_tensor_ptr(mtp_->get_kv()->get_v_storage(mtp_->il_graph_))) return false;
+    }
+    return true;
+}
+
+bool llama_memory_kvmem::pool_preserve_begin() {
+    if (pool_preserve_) {
+        pool_preserve_end(false);
+        return false;
+    }
+    if (!gpu_reuse_supported()) return false;
+    if (!reuse_tracking_) {
+        resident_tags_.resize(n_slots_);
+        reuse_tracking_ = true;
+        // Previous graphs may have run with reuse disabled. Establish a fresh
+        // authority boundary once; later per-batch writes invalidate only their
+        // own blocks, preserving shared ancestry of untouched pages.
+        note_external_kv_write();
+    }
+    pool_preserve_ = true;
+    return true;
+}
+
+void llama_memory_kvmem::pool_preserve_end(bool success) {
+    if (!success || !pool_preserve_) {
+        drop_resident_tags();
+        reuse_tracking_ = false;
+    }
+    pool_preserve_ = false;
+}
+
+void llama_memory_kvmem::note_gpu_write(int32_t slot) noexcept {
+    if (slot >= 0 && reuse_tracking_) resident_tags_.invalidate(static_cast<uint32_t>(slot));
+}
+
+void llama_memory_kvmem::note_external_kv_write() {
+    if (!reuse_tracking_) return;
+    drop_resident_tags();
+    harvest_flush();
+    harvest_gpu_v_commit();
+    if (mtp_) mtp_->harvest_flush();
+    for (const auto & b : runtime_->store().blocks()) {
+        if (b.gpu_slot < 0) continue;
+        note_gpu_write(b.gpu_slot);
+        raw_->invalidate_packed_block(b.block_id, 0);
+        if (mtp_) mtp_->invalidate_cached_block(b.block_id, 0);
+    }
+}
+
+bool llama_memory_kvmem::block_payload_refs(uint32_t id, uint32_t rows,
+                                          kvmem_resident_tags::payloads & refs) const {
+    refs.clear();
+    kvmem_resident_tags::payload k, v;
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        if (!kvmem_cache_has_layer(kv_, il)) continue;
+        if (!raw_->packed_refs(id, il, rows, k, v)) return false;
+        refs.push_back(std::move(k));
+        refs.push_back(std::move(v));
+    }
+    if (mtp_) {
+        if (!mtp_->raw().packed_refs(id, 0, rows, k, v)) return false;
+        refs.push_back(std::move(k));
+        refs.push_back(std::move(v));
+    }
+    return !refs.empty();
+}
+
+void llama_memory_kvmem::publish_resident_tags(uint32_t rows) {
+    if (!pool_preserve_) return;
+    if (cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) throw std::runtime_error("resident tag capture fence failed");
+    for (const auto & b : runtime_->store().blocks()) {
+        if (b.gpu_slot < 0) continue;
+        kvmem_resident_tags::payloads refs;
+        if (b.orig_pos_end() > rows || !gpu_kv_complete(b.block_id, kv_) ||
+                (mtp_ && !gpu_kv_complete(b.block_id, mtp_->get_kv())) ||
+                !block_payload_refs(b.block_id, b.n_tokens, refs)) {
+            note_gpu_write(b.gpu_slot);
+            continue;
+        }
+        resident_tags_.publish(b.gpu_slot, b.orig_pos_start, b.n_tokens, std::move(refs));
+    }
+}
+
+bool llama_memory_kvmem::restage_resident_tags(const std::vector<uint32_t> & resident) {
+    struct restored {
+        uint32_t id;
+        kvmem_resident_tags::payloads refs;
+    };
+    std::vector<restored> ready;
+    ready.reserve(resident.size());
+    for (uint32_t id : resident) {
+        const auto & b = runtime_->store().blocks()[id];
+        restored page{id, {}};
+        if (!block_payload_refs(id, b.n_tokens, page.refs)) return false;
+        if (resident_tags_.matches(b.gpu_slot, b.orig_pos_start, b.n_tokens, page.refs)) {
+            occupy_block_cells(id);
+            if (mtp_) mtp_->occupy_block(id);
+            ++resident_stats_.hit_blocks;
+            const size_t target_layers = (page.refs.size() - (mtp_ ? 2 : 0)) / 2;
+            resident_stats_.skipped_target_bytes += uint64_t(b.n_tokens) * target_layers *
+                    (raw_->config().k_gpu_row_bytes + raw_->config().v_gpu_row_bytes);
+            if (mtp_) resident_stats_.skipped_mtp_bytes += uint64_t(b.n_tokens) *
+                    (mtp_->raw().config().k_gpu_row_bytes + mtp_->raw().config().v_gpu_row_bytes);
+        } else {
+            ++resident_stats_.miss_blocks;
+            write_block_to_gpu(id);
+            if (mtp_) mtp_->write_block_to_gpu(id);
+        }
+        ready.push_back(std::move(page));
+    }
+    if (!kvmem_stagein_flush(nullptr, nullptr, nullptr, nullptr) ||
+            cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) return false;
+    for (auto & page : ready) {
+        const auto & b = runtime_->store().blocks()[page.id];
+        if (!gpu_kv_complete(page.id, kv_) || (mtp_ && !gpu_kv_complete(page.id, mtp_->get_kv()))) return false;
+        resident_tags_.publish(b.gpu_slot, b.orig_pos_start, b.n_tokens, std::move(page.refs));
+    }
+    return true;
+}
+
+std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_rows) {
+    if (!runtime_ || !raw_ || !kv_ || v_trans_ || replay_ || raw_->nvme_enabled()) return nullptr;
+    if (mtp_ && !mtp_->can_stash()) return nullptr;
+    auto & store = runtime_->store();
+    const uint32_t total = std::min(store.total_tokens(), max_rows);
+    if (total == 0) return nullptr;
+
+    // Packed K/V of every resident block must be on the host before the GPU
+    // pages are dropped. Decode and retrieval pin the working set, which
+    // disables the async harvest, so harvest explicitly here.
+    decode_mean_flush();
+    decode_mean_discard();
+    harvest_flush();
+    harvest_gpu_v_commit();
+    std::vector<uint32_t> resident;
+    for (const auto & b : store.blocks()) {
+        if (b.gpu_slot < 0 || b.n_tokens == 0) continue;
+        resident.push_back(b.block_id);
+        harvest_gpu_v(b.block_id);
+    }
+    harvest_gpu_v_commit();
+    if (mtp_) mtp_->harvest_resident_v();
+
+    uint32_t rows = total;
+    for (const auto & b : store.blocks()) {
+        if (b.orig_pos_start >= rows) break;
+        const uint32_t n = std::min(b.n_tokens, rows - b.orig_pos_start);
+        bool ok = true;
+        for (uint32_t il = 0; il < n_layer_ && ok; ++il) {
+            if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) continue;
+            ok = raw_->has_k_gpu(b.block_id, il, n) && raw_->has_v_gpu(b.block_id, il, n);
+        }
+        if (ok && mtp_) ok = mtp_->raw_complete(b.block_id, n);
+        if (!ok) {
+            rows = b.orig_pos_start;
+            break;
+        }
+    }
+    if (rows != total || trace_) {
+        kvmem_diag("KVMEM_TRACE stash_take rows=%u total=%u resident=%zu\n", rows, total, resident.size());
+    }
+    if (rows == 0) return nullptr;
+
+    auto stash = std::make_unique<llama_kvmem_stash>();
+    stash->rows = rows;
+    // Allocate every replacement before moving any target state. MTP take
+    // likewise allocates first; after it succeeds the swaps cannot throw.
+    stash->runtime = std::make_unique<kvmem::KvMemRuntime>(runtime_->config(), &backend_);
+    stash->raw = std::make_unique<kvmem::RawKvStore>(raw_->config());
+    publish_resident_tags(rows);
+    if (mtp_) stash->mtp_raw = mtp_->take_raw();
+    runtime_.swap(stash->runtime);
+    raw_.swap(stash->raw);
+    row_positions_.swap(stash->row_positions);
+    stash->resident = std::move(resident);
+
+    // The stashed blocks now live only on the host. Drop their GPU slots before
+    // truncation so the detached runtime never frees slots of the live pool.
+    auto & ss = stash->runtime->store();
+    for (uint32_t id : stash->resident) {
+        ss.set_block_tier(id, kvmem::KvTier::CPU, -1, ss.blocks()[id].nvme_slot);
+        ss.set_block_io_in_flight(id, false);
+    }
+    ss.clear_working_set();
+    try {
+        if (!stash->truncate_to(rows)) {
+            stash_reset_empty();
+            return nullptr;
+        }
+    } catch (...) {
+        stash_reset_empty();
+        throw;
+    }
+    stash_reset_empty(pool_preserve_);
+    return stash;
+}
+
+void llama_memory_kvmem::stash_reset_empty(bool preserve) {
+    // Drain uploads before clearing cells: an exception can leave a partially
+    // filled stage-in slab queued against slots that are about to be reused.
+    kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
+    if (!preserve) pool_preserve_end(false);
+    kv_->clear(!preserve);
+    if (mtp_) mtp_->clear(true);
+    decode_mean_discard();
+    decode_mean_n_ = 0;
+    reset_policy();
+    harvest_gpu_queued_.clear();
+}
+
+bool llama_memory_kvmem::stash_restage(const std::vector<uint32_t> & resident) {
+    ++attention_epoch_;
+    reset_slots();
+    reset_query_acc();
+    explicit_spans_ = false;
+    query_frozen_ = false;
+    turn_spans_ = {};
+    retrieval_pinned_ = false;
+    keep_selected_ = false;
+    prefill_capture_ = true;
+    if (resident.empty()) return true;
+    if (resident.size() > n_slots_) return false;
+    // Validate coverage before occupying any cells. Do not silently restore a
+    // smaller selection when the saved set exceeds the semantic GPU budget.
+    const auto & store = runtime_->store();
+    for (uint32_t id : resident) {
+        if (id >= store.block_count()) return false;
+        const uint32_t n = store.blocks()[id].n_tokens;
+        for (uint32_t il = 0; il < n_layer_; ++il) {
+            if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) continue;
+            if (!raw_->has_k_gpu(id, il, n) || !raw_->has_v_gpu(id, il, n)) return false;
+        }
+        if (mtp_ && !mtp_->raw_complete(id, n)) return false;
+    }
+    // Prefill attends only to GPU-resident blocks, so the working set has to be
+    // back before the next append; retrieval would only run after the query.
+    const kvmem::KvMemPlan plan = runtime_->prepare_selection(resident);
+    trace_plan("stash_restage", plan);
+    apply_plan_to_kv(plan);
+    if (reuse_tracking_ && gpu_reuse_supported()) {
+        int32_t slot = 0;
+        bool canonical = true;
+        for (const auto & b : store.blocks()) {
+            if (b.gpu_slot >= 0 && b.gpu_slot != slot++) canonical = false;
+        }
+        if (canonical) return restage_resident_tags(resident);
+    }
+    if (!layout_gpu_slots_by_orig_pos()) {
+        for (uint32_t id : plan.stage_in) {
+            if (id < runtime_->store().block_count() && runtime_->store().blocks()[id].gpu_slot >= 0) {
+                write_block_to_gpu(id);
+            }
+        }
+        const bool uploaded = kvmem_stagein_flush(nullptr, nullptr, nullptr, nullptr);
+        kvmem_stagein_sync();
+        if (!uploaded) return false;
+    }
+    if (mtp_) mtp_->follow_retrieval();
+    for (uint32_t id : resident) {
+        if (runtime_->store().blocks()[id].gpu_slot < 0) {
+            LLAMA_LOG_ERROR("%s: block %u was not restaged\n", __func__, id);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_memory_kvmem::stash_put(std::unique_ptr<llama_kvmem_stash> stash) {
+    const uint32_t rows = stash ? stash->rows : 0;
+    return stash_put_prefix(std::move(stash), rows);
+}
+
+bool llama_memory_kvmem::stash_put_prefix(std::unique_ptr<llama_kvmem_stash> stash, uint32_t rows) {
+    if (!stash || !stash->runtime || !stash->raw || !runtime_ || !raw_ || store_n_tokens() != 0) return false;
+    if ((mtp_ != nullptr) != (stash->mtp_raw != nullptr)) return false;
+    if (kv_->get_cells(0).get_used() || (mtp_ && mtp_->get_kv()->get_cells(0).get_used())) return false;
+    if (!stash->truncate_to(rows)) return false;
+    harvest_flush();
+    harvest_gpu_v_commit();
+    // The consumed stash now owns the old empty objects until restore commits.
+    // Rollback never truncates a partially restored runtime (which allocates a
+    // dropped-block list and can itself fail under memory pressure).
+    runtime_.swap(stash->runtime);
+    raw_.swap(stash->raw);
+    row_positions_.swap(stash->row_positions);
+    if (mtp_) mtp_->swap_raw(stash->mtp_raw);
+    const auto rollback = [&]() {
+        runtime_.swap(stash->runtime);
+        raw_.swap(stash->raw);
+        row_positions_.swap(stash->row_positions);
+        if (mtp_) mtp_->swap_raw(stash->mtp_raw);
+        stash_reset_empty();
+    };
+    try {
+        if (stash_restage(stash->resident)) return true;
+    } catch (...) {
+        rollback();
+        throw;
+    }
+    rollback();
+    return false;
+}
+
+bool llama_memory_kvmem::stash_fork(const llama_kvmem_stash & stash, uint32_t rows) {
+    if (!stash.runtime || !stash.raw || store_n_tokens() != 0) return false;
+    if (mtp_ != nullptr && !stash.mtp_raw) return false;
+    rows = std::min(rows, stash.rows);
+    if (rows == 0 || stash.row_positions.size() < rows) return false;
+    auto copy = std::make_unique<llama_kvmem_stash>();
+    copy->rows = rows;
+    const bool cow = g_kvmem_pool_copy_cow.load(std::memory_order_relaxed);
+    copy->raw = cow ? stash.raw->clone_prefix(rows) : stash.raw->clone_prefix_deep(rows);
+    if (mtp_) copy->mtp_raw = cow ? stash.mtp_raw->clone_prefix(rows) : stash.mtp_raw->clone_prefix_deep(rows);
+    copy->row_positions.assign(stash.row_positions.begin(), stash.row_positions.begin() + rows);
+    copy->runtime = std::make_unique<kvmem::KvMemRuntime>(stash.runtime->config(), &backend_);
+    copy->runtime->register_append(rows);
+    auto & store = copy->runtime->store();
+    for (uint32_t id = 0; id < store.block_count(); ++id) {
+        store.set_block_tier(id, kvmem::KvTier::CPU, -1, -1);
+    }
+    for (uint32_t id : stash.resident) {
+        if (id < store.block_count()) copy->resident.push_back(id);
+    }
+    return stash_put_prefix(std::move(copy), rows);
 }
 
 void llama_memory_kvmem::trace_working_set(const char * tag) const {
@@ -3776,6 +4214,132 @@ void llama_kvmem_get_tail_mean(uint32_t row, std::vector<float> & state) {
         mem->harvest_flush();
         mem->decode_mean_flush();
         state = mem->raw().mean_checkpoint(row);
+    }
+}
+
+llama_kvmem_stash * llama_kvmem_stash_take(uint32_t max_rows, uint32_t * rows) {
+    if (rows) *rows = 0;
+    auto * mem = kvmem_capture_active();
+    if (!mem) return nullptr;
+    try {
+        auto stash = mem->stash_take(max_rows);
+        if (!stash) mem->pool_preserve_end(false);
+        if (stash && rows) *rows = stash->rows;
+        return stash.release();
+    } catch (const std::exception & e) {
+        mem->pool_preserve_end(false);
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return nullptr;
+    }
+}
+
+bool llama_kvmem_stash_put(llama_kvmem_stash * stash) {
+    const uint32_t rows = stash ? stash->rows : 0;
+    return llama_kvmem_stash_put_prefix(stash, rows);
+}
+
+bool llama_kvmem_stash_put_prefix(llama_kvmem_stash * stash, uint32_t rows) {
+    std::unique_ptr<llama_kvmem_stash> owned(stash);
+    auto * mem = kvmem_capture_active();
+    if (!mem) return false;
+    try {
+        const bool ok = mem->stash_put_prefix(std::move(owned), rows);
+        if (!ok) mem->pool_preserve_end(false);
+        return ok;
+    } catch (const std::exception & e) {
+        mem->pool_preserve_end(false);
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}
+
+bool llama_kvmem_stash_fork(const llama_kvmem_stash * stash, uint32_t rows) {
+    auto * mem = kvmem_capture_active();
+    if (!mem || !stash) return false;
+    try {
+        const bool ok = mem->stash_fork(*stash, rows);
+        if (!ok) mem->pool_preserve_end(false);
+        return ok;
+    } catch (const std::exception & e) {
+        mem->pool_preserve_end(false);
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}
+
+size_t llama_kvmem_stash_bytes(const llama_kvmem_stash * stash) {
+    return stash ? stash->bytes() : 0;
+}
+
+void llama_kvmem_stash_free(llama_kvmem_stash * stash) {
+    delete stash;
+}
+
+void llama_kvmem_set_pool_copy(bool cow) {
+    g_kvmem_pool_copy_cow.store(cow, std::memory_order_relaxed);
+}
+
+void llama_kvmem_set_pool_gpu_reuse(bool enabled) {
+    if (auto * mem = kvmem_capture_active()) mem->pool_preserve_end(false);
+    g_kvmem_pool_gpu_reuse.store(enabled, std::memory_order_relaxed);
+}
+
+bool llama_kvmem_pool_preserve_begin() {
+    auto * mem = kvmem_capture_active();
+    if (!mem) return false;
+    try {
+        return mem->pool_preserve_begin();
+    } catch (const std::exception & e) {
+        mem->pool_preserve_end(false);
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}
+
+void llama_kvmem_pool_preserve_end(bool success) {
+    if (auto * mem = kvmem_capture_active()) mem->pool_preserve_end(success);
+}
+
+void llama_kvmem_drop_resident_tags() {
+    if (auto * mem = kvmem_capture_active()) mem->drop_resident_tags();
+}
+
+void llama_kvmem_notify_external_kv_write() {
+    if (auto * mem = kvmem_capture_active()) mem->note_external_kv_write();
+}
+
+bool llama_kvmem_get_resident_stats(llama_kvmem_resident_stats & out) {
+    auto * mem = kvmem_capture_active();
+    if (!mem) return false;
+    out = mem->resident_stats();
+    return true;
+}
+
+bool llama_kvmem_stash_allocations(const llama_kvmem_stash * stash,
+                                  std::vector<std::pair<const void *, size_t>> & out) {
+    if (!stash) return false;
+    const size_t before = out.size();
+    try {
+        stash->append_allocations(out);
+        return true;
+    } catch (const std::exception & e) {
+        out.resize(before);
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}
+
+bool llama_kvmem_live_allocations(std::vector<std::pair<const void *, size_t>> & out) {
+    auto * mem = kvmem_capture_active();
+    if (!mem) return false;
+    const size_t before = out.size();
+    try {
+        mem->append_allocations(out);
+        return true;
+    } catch (const std::exception & e) {
+        out.resize(before);
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
     }
 }
 

@@ -41,10 +41,68 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 using json = nlohmann::json;
 
 static bool eq(const char * a, const char * b) {
     return std::strcmp(a, b) == 0;
+}
+
+// Run before common logging/backends can create threads or load the model.
+static bool apply_windows_resource_policy() {
+    const char * mode = std::getenv("KVMEM_WINDOWS_RESOURCE_POLICY");
+    if (!mode || !*mode) mode = "inherit";
+    if (!eq(mode, "normal") && !eq(mode, "inherit")) {
+        fprintf(stderr, "KVMEM_RESOURCE_POLICY invalid mode (want normal|inherit)\n");
+        return false;
+    }
+#ifdef _WIN32
+    const bool normal = eq(mode, "normal");
+    const HANDLE process = GetCurrentProcess(), thread = GetCurrentThread();
+    auto failed = [&](const char * api, DWORD error) {
+        fprintf(stderr, "KVMEM_RESOURCE_POLICY pid=%lu mode=%s api=%s error=%lu\n",
+                GetCurrentProcessId(), mode, api, error);
+    };
+    if (normal) {
+        MEMORY_PRIORITY_INFORMATION memory = {MEMORY_PRIORITY_NORMAL};
+        if (!SetPriorityClass(process, NORMAL_PRIORITY_CLASS)) {
+            failed("SetPriorityClass", GetLastError());
+            return false;
+        }
+        if (!SetProcessInformation(process, ProcessMemoryPriority, &memory, sizeof(memory))) {
+            failed("SetProcessInformation", GetLastError());
+            return false;
+        }
+        if (!SetThreadInformation(thread, ThreadMemoryPriority, &memory, sizeof(memory))) {
+            failed("SetThreadInformation", GetLastError());
+            return false;
+        }
+    }
+    const DWORD cpu = GetPriorityClass(process);
+    bool valid = cpu != 0;
+    if (!valid) failed("GetPriorityClass", GetLastError());
+    MEMORY_PRIORITY_INFORMATION process_memory = {}, thread_memory = {};
+    if (!GetProcessInformation(process, ProcessMemoryPriority, &process_memory, sizeof(process_memory))) {
+        failed("GetProcessInformation", GetLastError());
+        valid = false;
+    }
+    if (!GetThreadInformation(thread, ThreadMemoryPriority, &thread_memory, sizeof(thread_memory))) {
+        failed("GetThreadInformation", GetLastError());
+        valid = false;
+    }
+    const bool matched = valid && cpu == NORMAL_PRIORITY_CLASS &&
+        process_memory.MemoryPriority == MEMORY_PRIORITY_NORMAL && thread_memory.MemoryPriority == MEMORY_PRIORITY_NORMAL;
+    fprintf(stderr, "KVMEM_RESOURCE_POLICY pid=%lu mode=%s cpu_class=%lu process_memory=%lu main_thread_memory=%lu readback=%s\n",
+            GetCurrentProcessId(), mode, cpu, process_memory.MemoryPriority, thread_memory.MemoryPriority,
+            !valid ? "failed" : normal && !matched ? "mismatch" : "ok");
+    return !normal || matched;
+#else
+    fprintf(stderr, "KVMEM_RESOURCE_POLICY mode=%s platform=non_windows applied=0\n", mode);
+    return true;
+#endif
 }
 
 static void print_usage(const char * argv0) {
@@ -116,6 +174,25 @@ static void print_usage(const char * argv0) {
             "  --kvmem-query-replay MODE  legacy or auto (default auto)\n"
             "  --kvmem-query-policy MODE  legacy or user (default user)\n"
             "  --kvmem-mtp-state MODE     snapshots, auto or replay (default replay with MTP)\n"
+            "  --kvmem-ckpt-max N         recurrent prefix checkpoints kept in host RAM (default 24, min 4)\n"
+            "  --kvmem-ckpt-interval N    first-pass checkpoint every N rows (default 4096, 0 = off)\n"
+            "  --kvmem-ckpt-window N      checkpoint message starts within N rows before the query (default 8192, 0 = off)\n"
+            "  --kvmem-ckpt-min-gap N     minimum rows between first-pass checkpoints (default 256)\n"
+            "  --no-kvmem-keep-aborted    on cancel/failure roll back to the request start instead of\n"
+            "                            the newest checkpoint of the aborted prefill\n"
+            "  --kvmem-pool-gb G          tracked pool+live unique host RAM budget (default 12)\n"
+            "  --kvmem-pool-max N         parked conversations kept (default 6)\n"
+            "  --kvmem-pool-min-rows N    park only conversations with at least N rows (default 2048)\n"
+            "  --kvmem-pool-min-gain N    switch/fork only when it saves at least N rows (default 1024)\n"
+            "  --kvmem-pool-ckpts N       recurrent checkpoints kept per parked conversation (default 5)\n"
+            "  --kvmem-pool-ttl-min N     drop parked conversations idle for N minutes (default 0 = never)\n"
+            "  --no-kvmem-pool            single-conversation cache (prefix checkpoints only)\n"
+            "  --no-kvmem-pool-query      disable parked query save/import (live query reuse remains enabled)\n"
+            "  --kvmem-pool-restore MODE  full | prefix (default prefix)\n"
+            "  --kvmem-pool-copy MODE     deep | cow (default cow; fixed at startup)\n"
+            "  --kvmem-pic MODE           off | on (default off; on unavailable: integration incomplete)\n"
+            "  --pool-gpu-reuse MODE      on | off (default off; experimental same-slot GPU reuse)\n"
+            "  Environment: KVMEM_WINDOWS_RESOURCE_POLICY=normal|inherit (default inherit)\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe file in GiB (0 = off)\n"
@@ -193,7 +270,7 @@ struct MultimodalCheckpointData {
     std::vector<uint8_t> draft_carry;
     std::vector<float> tail_mean;
     std::shared_ptr<MultimodalCheckpointAccounting> accounting;
-    size_t bytes() const { return recurrent.size() + draft_carry.size() + tail_mean.size()*sizeof(float); }
+    size_t bytes() const { return recurrent.capacity() + draft_carry.capacity() + tail_mean.capacity()*sizeof(float); }
 };
 
 struct MultimodalCheckpoint {
@@ -204,10 +281,45 @@ struct MultimodalCheckpoint {
 
 struct MultimodalQuery {
     int begin = -1, end = -1, force = -1;
+    uint64_t generation = 0;
+    const llama_model * model = nullptr;
     std::string user;
-    std::shared_ptr<kvmem_prompt> prefix;
+    // Retain just the tokens and media identities, not native media/prompt storage.
+    std::vector<llama_token> prefix;
     std::vector<std::pair<uint32_t, std::string>> media;
     llama_kvmem_query_state state;
+    size_t bytes() const {
+        const auto heap_string_bytes = [](const std::string & s) -> size_t {
+            const auto data = reinterpret_cast<uintptr_t>(s.data());
+            const auto object = reinterpret_cast<uintptr_t>(&s);
+            return data < object || data >= object + sizeof(s) ? s.capacity() + 1 : 0;
+        };
+        size_t n = sizeof(*this) + heap_string_bytes(user) + prefix.capacity()*sizeof(llama_token) +
+            media.capacity()*sizeof(media[0]) + state.sum.capacity()*sizeof(state.sum[0]) +
+            state.count.capacity()*sizeof(uint32_t);
+        for (const auto & id : media) n += heap_string_bytes(id.second);
+        for (const auto & layer : state.sum) n += layer.capacity()*sizeof(float);
+        return n;
+    }
+};
+
+// One conversation parked in host RAM while another owns the single slot.
+struct PoolEntry {
+    PoolEntry() = default;
+    PoolEntry(const PoolEntry &) = delete;
+    PoolEntry & operator=(const PoolEntry &) = delete;
+    ~PoolEntry() { llama_kvmem_stash_free(stash); }
+    uint64_t id = 0;
+    llama_kvmem_stash * stash = nullptr;
+    std::shared_ptr<kvmem_prompt> prompt;
+    std::vector<MultimodalCheckpoint> checkpoints;
+    std::shared_ptr<const MultimodalQuery> query;
+    uint64_t generation = 0;
+    int rows = 0;
+    // Legacy logical stash payload only, never used for the unique budget.
+    size_t bytes = 0;
+    std::chrono::steady_clock::time_point created, last_used;
+    uint32_t hits = 0;
 };
 
 struct ServerState {
@@ -253,12 +365,41 @@ struct ServerState {
     std::shared_ptr<MultimodalCheckpointAccounting> mm_checkpoint_accounting = std::make_shared<MultimodalCheckpointAccounting>();
     std::shared_ptr<const MultimodalQuery> mm_query;
     std::shared_ptr<const MultimodalQuery> mm_pending_query;
+    // Model and cache configuration are immutable for this ServerState lifetime.
+    // Explicit resets advance this epoch; internal branch clears must not.
+    uint64_t mm_cache_generation = 1;
     bool mm_committed = true;
     uint32_t mm_new_text = 0;
     uint32_t mm_new_image = 0;
     uint32_t mm_replayed = 0;
     uint32_t mm_tail_replayed = 0;
     int mm_lcp = 0;
+    // Partial prefix reuse: extra GDN checkpoints taken during the first pass at
+    // message boundaries and fixed intervals, so a prompt that diverges early
+    // (rewritten turn tail, stripped thinking) restores near the divergence.
+    int mm_ckpt_max = 24;
+    int mm_ckpt_interval = 4096;
+    int mm_ckpt_window = 8192;
+    int mm_ckpt_min_gap = 256;
+    bool mm_keep_aborted = true;
+    llama_token mm_msg_token = LLAMA_TOKEN_NULL;
+    // Conversation pool: other conversations' KV kept in host RAM (LRU).
+    bool pool_enabled = true;
+    bool pool_query_enabled = true;
+    bool pool_restore_prefix = true;
+    bool pool_copy_cow = true;
+    bool pool_gpu_reuse = false;
+    double pool_gb = 12.0;
+    int pool_max = 6;
+    int pool_min_rows = 2048;
+    int pool_min_gain = 1024;
+    int pool_ckpts = 5;
+    int pool_ttl_min = 0;
+    bool pool_reset_requested = false;
+    std::vector<std::unique_ptr<PoolEntry>> pool;
+    uint64_t pool_next_id = 1;
+    std::mutex pool_status_mu;
+    std::string pool_status = "{}";
     std::string mm_error;
     int mm_error_status = 500;
     bool mm_reset_requested = false;
@@ -426,6 +567,8 @@ static void memory_clear_all(ServerState & st) {
     st.mm_live_checkpoint.reset();
     st.mm_query.reset();
     st.mm_pending_query.reset();
+    llama_kvmem_reset_query();
+    llama_kvmem_freeze_query(false);
     st.gdn_ckpt.clear();
     st.gdn_carry.clear();
     st.gdn_query_carry.clear();
@@ -1529,6 +1672,7 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
 }
 
 int main(int argc, char ** argv) {
+    if (!apply_windows_resource_policy()) return 1;
     // Flush asynchronous common logs on every exit, including startup errors.
     struct log_flush_guard { ~log_flush_guard() { common_log_flush(common_log_main()); } } flush_logs;
     std::string ui_dir;
@@ -1679,6 +1823,99 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             st.kparams.mtp_state = mode == "replay" ? 2 : mode == "auto" ? 1 : 0;
+        } else if (eq(arg, "--kvmem-ckpt-max")) {
+            st.mm_ckpt_max = kvmem_cli_int(arg, need(arg));
+            if (st.mm_ckpt_max < 4) {
+                fprintf(stderr, "invalid --kvmem-ckpt-max (want >= 4)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-ckpt-interval")) {
+            st.mm_ckpt_interval = kvmem_cli_int(arg, need(arg));
+            if (st.mm_ckpt_interval < 0) {
+                fprintf(stderr, "invalid --kvmem-ckpt-interval (want >= 0)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-ckpt-window")) {
+            st.mm_ckpt_window = kvmem_cli_int(arg, need(arg));
+            if (st.mm_ckpt_window < 0) {
+                fprintf(stderr, "invalid --kvmem-ckpt-window (want >= 0)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-ckpt-min-gap")) {
+            st.mm_ckpt_min_gap = kvmem_cli_int(arg, need(arg));
+            if (st.mm_ckpt_min_gap < 1) {
+                fprintf(stderr, "invalid --kvmem-ckpt-min-gap (want >= 1)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--no-kvmem-keep-aborted")) {
+            st.mm_keep_aborted = false;
+        } else if (eq(arg, "--kvmem-pool-gb")) {
+            st.pool_gb = kvmem_cli_real(arg, need(arg), 0, 1048576);
+        } else if (eq(arg, "--kvmem-pool-max")) {
+            st.pool_max = kvmem_cli_int(arg, need(arg));
+            if (st.pool_max < 0) {
+                fprintf(stderr, "invalid --kvmem-pool-max (want >= 0)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-pool-min-rows")) {
+            st.pool_min_rows = kvmem_cli_int(arg, need(arg));
+            if (st.pool_min_rows < 1) {
+                fprintf(stderr, "invalid --kvmem-pool-min-rows (want >= 1)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-pool-min-gain")) {
+            st.pool_min_gain = kvmem_cli_int(arg, need(arg));
+            if (st.pool_min_gain < 0) {
+                fprintf(stderr, "invalid --kvmem-pool-min-gain (want >= 0)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-pool-ckpts")) {
+            st.pool_ckpts = kvmem_cli_int(arg, need(arg));
+            if (st.pool_ckpts < 2) {
+                fprintf(stderr, "invalid --kvmem-pool-ckpts (want >= 2)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--kvmem-pool-ttl-min")) {
+            st.pool_ttl_min = kvmem_cli_int(arg, need(arg));
+            if (st.pool_ttl_min < 0) {
+                fprintf(stderr, "invalid --kvmem-pool-ttl-min (want >= 0)\n");
+                return 1;
+            }
+        } else if (eq(arg, "--no-kvmem-pool")) {
+            st.pool_enabled = false;
+        } else if (eq(arg, "--no-kvmem-pool-query")) {
+            st.pool_query_enabled = false;
+        } else if (eq(arg, "--kvmem-pool-restore")) {
+            const char * mode = need(arg);
+            if (!eq(mode, "full") && !eq(mode, "prefix")) {
+                fprintf(stderr, "invalid --kvmem-pool-restore (want full|prefix)\n");
+                return 1;
+            }
+            st.pool_restore_prefix = eq(mode, "prefix");
+        } else if (eq(arg, "--kvmem-pool-copy")) {
+            const char * mode = need(arg);
+            if (!eq(mode, "deep") && !eq(mode, "cow")) {
+                fprintf(stderr, "invalid --kvmem-pool-copy (want deep|cow)\n");
+                return 1;
+            }
+            st.pool_copy_cow = eq(mode, "cow");
+        } else if (eq(arg, "--pool-gpu-reuse") || eq(arg, "--kvmem-pool-gpu-reuse")) {
+            const char * mode = need(arg);
+            if (!eq(mode, "on") && !eq(mode, "off")) {
+                fprintf(stderr, "invalid --pool-gpu-reuse (want on|off)\n");
+                return 1;
+            }
+            st.pool_gpu_reuse = eq(mode, "on");
+        } else if (eq(arg, "--kvmem-pic")) {
+            const char * mode = need(arg);
+            if (eq(mode, "on")) {
+                fprintf(stderr, "KVMEM_STARTUP_ERROR PIC server integration is incomplete: adapter pic_kv_commit is unavailable; use --kvmem-pic off\n");
+                return 1;
+            }
+            if (!eq(mode, "off")) {
+                fprintf(stderr, "invalid --kvmem-pic (want off|on; on is not available in this build)\n");
+                return 1;
+            }
         } else if (eq(arg, "--kvmem-query-max-tokens")) {
             st.query_max_tokens = kvmem_cli_int(arg, need(arg));
             if (st.query_max_tokens <= 0) {
@@ -1865,6 +2102,8 @@ int main(int argc, char ** argv) {
     common_init();
     mtmd_helper_log_set(common_log_default_callback, nullptr);
     ggml_backend_load_all();
+    llama_kvmem_set_pool_copy(st.pool_copy_cow);
+    llama_kvmem_set_pool_gpu_reuse(st.pool_gpu_reuse);
 
     // No speculative rollback state is needed without MTP.
     if (!st.spec_mtp) st.kparams.mtp_state = 0;
@@ -1926,6 +2165,18 @@ int main(int argc, char ** argv) {
         return 1;
     }
     st.vocab = llama_model_get_vocab(st.model);
+    {
+        // ChatML message delimiter; message starts are cheap, high-value checkpoint rows.
+        const auto ids = tokenize_text(st.vocab, "<|im_start|>", false);
+        st.mm_msg_token = ids.size() == 1 ? ids[0] : LLAMA_TOKEN_NULL;
+        LOG_INF("srv    prefix checkpoints: max=%d interval=%d window=%d min_gap=%d keep_aborted=%d msg_token=%d\n",
+                st.mm_ckpt_max, st.mm_ckpt_interval, st.mm_ckpt_window, st.mm_ckpt_min_gap,
+                (int) st.mm_keep_aborted, (int) st.mm_msg_token);
+        LOG_INF("srv    kvmem pool: enabled=%d gb=%.1f max=%d min_rows=%d min_gain=%d ckpts=%d ttl_min=%d query=%d restore=%s copy=%s gpu_reuse=%s budget_scope=pool_and_live\n",
+                (int) st.pool_enabled, st.pool_gb, st.pool_max, st.pool_min_rows, st.pool_min_gain,
+                st.pool_ckpts, st.pool_ttl_min, (int) st.pool_query_enabled, st.pool_restore_prefix ? "prefix" : "full",
+                st.pool_copy_cow ? "cow" : "deep", st.pool_gpu_reuse ? "on" : "off");
+    }
     try {
         st.tmpls = common_chat_templates_init(st.model, chat_template);
     } catch (const std::exception & e) {
@@ -2123,6 +2374,12 @@ int main(int argc, char ** argv) {
         }
         res.set_content(json::array({slot}).dump(), "application/json");
     });
+    // Snapshot published by the request thread; never waits for inference.
+    svr.Get("/kvmem/pool", [&](const httplib::Request &, httplib::Response & res) {
+        res.set_header("Cache-Control", "no-store");
+        std::lock_guard<std::mutex> lk(st.pool_status_mu);
+        res.set_content(st.pool_status, "application/json");
+    });
     svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
         json j = {
             {"object", "list"},
@@ -2160,6 +2417,11 @@ int main(int argc, char ** argv) {
             res.set_content("{\"error\":\"cache_reset must be a boolean\"}", "application/json");
             return;
         }
+        if (body.contains("pool_reset") && !body["pool_reset"].is_boolean()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"pool_reset must be a boolean\"}", "application/json");
+            return;
+        }
 
         cr.sampling = kvmem_chat_sampling_defaults(cr.enable_thinking);
         if (!kvmem_chat_sampling_override(st.sampling_overrides, cr.sampling, err) ||
@@ -2172,6 +2434,7 @@ int main(int argc, char ** argv) {
         auto slot = std::make_shared<kvmem_server_slot_guard>(st.mu, st.progress);
         if (req.is_connection_closed && req.is_connection_closed()) return;
         st.mm_reset_requested = body.value("cache_reset", false);
+        st.pool_reset_requested = body.value("pool_reset", false);
 
         common_chat_templates_inputs inputs;
         inputs.messages = cr.msgs;

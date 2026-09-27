@@ -237,18 +237,32 @@ llama_memory_context_ptr llama_memory_kvmem_mtp::init_batch(
 }
 
 llama_memory_context_ptr llama_memory_kvmem_mtp::init_full() {
+    if (target_) target_->note_external_kv_write();
     return kv_->init_full();
 }
 
 llama_memory_context_ptr llama_memory_kvmem_mtp::init_update(llama_context * lctx, bool optimize) {
-    return kv_->init_update(lctx, optimize);
+    auto update = kv_->init_update(lctx, optimize);
+    if (target_ && update->get_status() != LLAMA_MEMORY_STATUS_NO_UPDATE) target_->note_external_kv_write();
+    return update;
 }
 
 void llama_memory_kvmem_mtp::clear(bool data) {
     if (target_) target_->note_attention_change();
-    kv_->clear(data);
+    const bool preserve = target_ && target_->preserving_gpu_contents();
+    if (target_ && !preserve) target_->pool_preserve_end(false);
+    kv_->clear(data && !preserve);
     raw_->clear();
+    pending_capture_.clear();
     pos_queue_.clear();
+    cur_pos_.clear();
+}
+
+std::unique_ptr<kvmem::RawKvStore> llama_memory_kvmem_mtp::take_raw() {
+    harvest_flush();
+    auto replacement = std::make_unique<kvmem::RawKvStore>(raw_->config());
+    raw_.swap(replacement);
+    return replacement;
 }
 
 bool llama_memory_kvmem_mtp::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -258,6 +272,7 @@ bool llama_memory_kvmem_mtp::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 }
 
 void llama_memory_kvmem_mtp::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (target_) target_->note_external_kv_write();
     if (target_) target_->note_attention_change();
     kv_->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
@@ -268,11 +283,13 @@ void llama_memory_kvmem_mtp::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_kvmem_mtp::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (target_) target_->note_external_kv_write();
     if (target_) target_->note_attention_change();
     kv_->seq_add(seq_id, p0, p1, shift);
 }
 
 void llama_memory_kvmem_mtp::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    if (target_) target_->note_external_kv_write();
     if (target_) target_->note_attention_change();
     kv_->seq_div(seq_id, p0, p1, d);
 }
@@ -294,6 +311,7 @@ void llama_memory_kvmem_mtp::state_write(llama_io_write_i & io, llama_seq_id seq
 }
 
 void llama_memory_kvmem_mtp::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (target_) target_->note_external_kv_write();
     if (target_) target_->note_attention_change();
     kv_->state_read(io, seq_id, flags);
 }
@@ -312,6 +330,20 @@ void llama_memory_kvmem_mtp::harvest_flush() {
     if (raw_) {
         raw_->wait_writes();
     }
+}
+
+bool llama_memory_kvmem_mtp::before_ubatch(uint32_t n, const llama_pos * rows) {
+    if (!target_ || !target_->gpu_reuse_requested()) return true;
+    if (!rows) return false;
+    harvest_flush();
+    for (uint32_t i = 0; i < n; ++i) {
+        int32_t slot = -1;
+        uint32_t off = 0;
+        if (rows[i] < 0 || !target_->slot_for_orig_pos(rows[i], &slot, &off)) return false;
+        target_->note_gpu_write(slot);
+        raw_->invalidate_packed_block(uint32_t(rows[i]) / block_tokens_, off);
+    }
+    return true;
 }
 
 void llama_memory_kvmem_mtp::harvest_pending(struct ggml_backend_sched * sched) {
@@ -408,6 +440,7 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
     if (!kv_ || !moves || n_moves == 0) {
         return true;
     }
+    if (target_) target_->drop_resident_tags();
     ggml_tensor * kt = kv_->get_k_storage((int32_t) il_graph_);
     ggml_tensor * vt = kv_->get_v_storage((int32_t) il_graph_);
     uint8_t * kbase = kvmem_mtp_cuda_ptr(kt);
@@ -506,6 +539,7 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
     if (blk.gpu_slot < 0) {
         return;
     }
+    target_->note_gpu_write(blk.gpu_slot);
     target_->note_attention_change();
     const uint32_t nt = blk.n_tokens;
     occupy_block(block_id);

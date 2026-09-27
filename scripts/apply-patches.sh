@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LLAMA="${KVMEM_LLAMA_DIR:-$ROOT/llama.cpp}"
 PATCH="$ROOT/patches/llama-kvmem-current.patch"
+CACHE_UPGRADE="$ROOT/patches/cache-revision-upgrade.patch"
 BUDGET_UPGRADE="$ROOT/patches/reasoning-budget-upgrade.patch"
 REPLAY_UPGRADE="$ROOT/patches/replayssm-upgrade.patch"
 UPGRADE="$ROOT/patches/multimodal-upgrade.patch"
@@ -14,17 +15,23 @@ cd "$LLAMA"
 can_upgrade() {
     local upgrade="$1" check_dir added removed path rc=1
     git apply --check "$upgrade" 2>/dev/null || return 1
-    check_dir="$(mktemp -d)"
+    check_dir="$(mktemp -d "$ROOT/.kvmem-patch-check.XXXXXX")"
     while IFS=$'\t' read -r added removed path; do
         if [[ -f "$path" ]]; then
             mkdir -p "$check_dir/$(dirname "$path")"
             cp -p -- "$path" "$check_dir/$path"
         fi
     done < <(git apply --numstat "$PATCH")
-    if (cd "$check_dir" && git apply "$upgrade" && git apply --reverse --check "$PATCH") 2>/dev/null; then
+    if (cd "$check_dir" && git apply "$upgrade" &&
+        (git apply --reverse --check "$PATCH" ||
+         (git apply --check "$CACHE_UPGRADE" && git apply "$CACHE_UPGRADE" &&
+          git apply --reverse --check "$PATCH"))) 2>/dev/null; then
         rc=0
     fi
-    rm -rf -- "$check_dir"
+    case "$check_dir" in
+        "$ROOT"/.kvmem-patch-check.*) rm -rf -- "$check_dir" ;;
+        *) echo "unexpected patch-check directory" >&2; return 1 ;;
+    esac
     return "$rc"
 }
 
@@ -33,6 +40,9 @@ if git apply --reverse --check "$PATCH" 2>/dev/null; then
 elif git apply --check "$PATCH" 2>/dev/null; then
     git apply "$PATCH"
     echo "applied current KVMem patch to pinned llama.cpp"
+elif can_upgrade "$CACHE_UPGRADE"; then
+    git apply "$CACHE_UPGRADE"
+    echo "upgraded the rc3 tree with cache revision hooks"
 elif can_upgrade "$BUDGET_UPGRADE"; then
     git apply "$BUDGET_UPGRADE"
     echo "upgraded existing KVMem tree with reasoning budget fix"
@@ -46,4 +56,10 @@ else
     echo "llama.cpp differs from the supported pin or KVMem baseline; no files changed" >&2
     echo "inspect local changes before replaying $PATCH" >&2
     exit 1
+fi
+
+# Older compatibility upgrades stop at the pre-cache-revision baseline.
+if ! git apply --reverse --check "$CACHE_UPGRADE" 2>/dev/null; then
+    git apply --check "$CACHE_UPGRADE"
+    git apply "$CACHE_UPGRADE"
 fi

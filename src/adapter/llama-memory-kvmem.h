@@ -3,6 +3,7 @@
 #include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-kvmem-hooks.h"
+#include "kvmem-resident-tags.h"
 
 #include "kvmem/kvmem_runtime.hpp"
 #include "kvmem/raw_kv_store.hpp"
@@ -14,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 struct llama_model;
@@ -92,6 +94,8 @@ public:
     const kvmem::KvMemStore & store() const { return runtime_->store(); }
 
     void note_ubatch_pos(const std::vector<llama_pos> & pos);
+    bool before_ubatch(uint32_t n, const llama_pos * rows);
+    bool gpu_reuse_requested() const;
     void reset_query_acc();
     void register_capture(struct ggml_tensor * t, int il, char which);
     void capture_on_new_graph();
@@ -168,7 +172,10 @@ public:
         query_end_ = end;
     }
     void set_force_pos(int32_t pos) { force_pos_ = pos; }
-    void set_mtp_follower(llama_memory_kvmem_mtp * mtp) { mtp_ = mtp; }
+    void set_mtp_follower(llama_memory_kvmem_mtp * mtp) {
+        if (mtp_ != mtp) pool_preserve_end(false);
+        mtp_ = mtp;
+    }
     llama_memory_kvmem_mtp * mtp_follower() { return mtp_; }
 
     const kvmem::RopeConfig & rope() const { return rope_; }
@@ -180,8 +187,36 @@ public:
 
     kvmem::RawKvStore & raw() { return *raw_; }
 
+    // Conversation pool. take moves this sequence's host KV (packed K/V,
+    // block table, row positions, MTP raw) into a stash and leaves the live
+    // memory empty; put moves a stash back and re-stages the blocks that were
+    // GPU-resident; fork does the same from a clone of a stash prefix.
+    // put/fork require an empty live memory (after llama_memory_clear).
+    // Both put variants consume their argument on every outcome.
+    std::unique_ptr<llama_kvmem_stash> stash_take(uint32_t max_rows);
+    bool stash_put(std::unique_ptr<llama_kvmem_stash> stash);
+    bool stash_put_prefix(std::unique_ptr<llama_kvmem_stash> stash, uint32_t rows);
+    bool stash_fork(const llama_kvmem_stash & stash, uint32_t rows);
+    void append_allocations(std::vector<std::pair<const void *, size_t>> & out);
+    bool pool_preserve_begin();
+    void pool_preserve_end(bool success);
+    bool preserving_gpu_contents() const { return pool_preserve_; }
+    bool tracking_gpu_writes() const { return reuse_tracking_; }
+    void drop_resident_tags() noexcept { resident_tags_.clear(); }
+    void note_gpu_write(int32_t slot) noexcept;
+    void note_external_kv_write();
+    const llama_kvmem_resident_stats & resident_stats() const { return resident_stats_; }
+
 private:
     friend struct kvmem_transfer_test_access;
+    friend struct llama_kvmem_stash;
+    bool stash_restage(const std::vector<uint32_t> & resident);
+    // Called only with an empty runtime, including after restore rollback.
+    void stash_reset_empty(bool preserve = false);
+    bool gpu_reuse_supported() const;
+    bool block_payload_refs(uint32_t id, uint32_t rows, kvmem_resident_tags::payloads & refs) const;
+    void publish_resident_tags(uint32_t rows);
+    bool restage_resident_tags(const std::vector<uint32_t> & resident);
     struct SlotBackend : public kvmem::KvMemBackend {
         llama_memory_kvmem * owner = nullptr;
         int32_t alloc_gpu_slot() override { return owner->alloc_slot(); }
@@ -347,6 +382,10 @@ private:
     std::unique_ptr<kvmem::KvMemRuntime> runtime_;
     std::unique_ptr<kvmem::RawKvStore> raw_;
     std::vector<int32_t> free_slots_;
+    kvmem_resident_tags resident_tags_;
+    llama_kvmem_resident_stats resident_stats_;
+    bool pool_preserve_ = false;
+    bool reuse_tracking_ = false;
     struct RowPosition {
         std::array<llama_pos, 4> pos{};
         llama_token token = LLAMA_TOKEN_NULL;
@@ -422,6 +461,19 @@ private:
     RetrPerf retr_;
     std::vector<std::vector<float>> q_sum_;
     std::vector<uint32_t> q_count_;
+};
+
+struct llama_kvmem_stash {
+    std::unique_ptr<kvmem::KvMemRuntime> runtime;
+    std::unique_ptr<kvmem::RawKvStore> raw;
+    std::unique_ptr<kvmem::RawKvStore> mtp_raw;
+    std::vector<llama_memory_kvmem::RowPosition> row_positions;
+    std::vector<uint32_t> resident; // block ids that were on GPU when stashed
+    uint32_t rows = 0;
+    // Host-only: never release slots belonging to the active live memory.
+    bool truncate_to(uint32_t prefix_rows);
+    void append_allocations(std::vector<std::pair<const void *, size_t>> & out) const;
+    size_t bytes() const;
 };
 
 // GPU attn-cache cell count for a KVMem slot pool (budget + gen_reserve,

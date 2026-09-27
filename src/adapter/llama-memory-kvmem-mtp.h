@@ -62,6 +62,7 @@ public:
     void register_capture(struct ggml_tensor * t, int il, char which);
     void capture_on_new_graph();
     void harvest_pending(struct ggml_backend_sched * sched);
+    bool before_ubatch(uint32_t n, const llama_pos * rows);
     void harvest_flush();
     uint32_t harvest_perf_n_ubatch() const { return perf_n_ubatch_; }
     int64_t harvest_perf_sync_us() const { return perf_sync_us_; }
@@ -89,7 +90,20 @@ public:
     void truncate_cached(uint32_t n) { raw_->truncate_to(n); }
     void invalidate_packed_from(uint32_t n) { raw_->invalidate_packed_from(n); }
 
+    // Conversation pool: the draft raw store travels with the target's stash.
+    bool can_stash() const { return raw_ && !raw_->nvme_enabled(); }
+    bool raw_complete(uint32_t block_id, uint32_t n) const {
+        return raw_->has_k_gpu(block_id, 0, n) && (v_trans_ || raw_->has_v_gpu(block_id, 0, n));
+    }
+    const kvmem::RawKvStore & raw() const { return *raw_; }
+    void invalidate_cached_block(uint32_t id, uint32_t keep) { raw_->invalidate_packed_block(id, keep); }
+    std::unique_ptr<kvmem::RawKvStore> take_raw();
+    void put_raw(std::unique_ptr<kvmem::RawKvStore> raw) { raw_ = std::move(raw); }
+    // Retain the previous empty store for allocation-free restore rollback.
+    void swap_raw(std::unique_ptr<kvmem::RawKvStore> & raw) noexcept { raw_.swap(raw); }
+
 private:
+    friend class llama_memory_kvmem;
     bool fill_from_target(const llama_ubatch & ubatch, llama_kv_cache::slot_info & out);
     void write_block_to_gpu(uint32_t block_id);
     void harvest_k(uint32_t block_id);
