@@ -167,7 +167,7 @@ def cancel_prefill(port, body, timeout, evidence):
                     next_notice = time.monotonic() + 5
                 time.sleep(0.25)
         finally:
-            # SHUT_RDWR propagates through remote.forward before the close.
+            # SHUT_RDWR propagates through any port forward before the close.
             try:
                 peer.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -176,6 +176,42 @@ def cancel_prefill(port, body, timeout, evidence):
     evidence["partial_prefill_observed"] = observed
     evidence["idle_after_disconnect"] = wait_idle(port, timeout)
     evidence["released_wall_s"] = time.monotonic() - started
+    return observed
+
+
+def cancel_live_prefill(port, body, timeout, evidence, after_s=10.0):
+    """Disconnect a prefill that keeps the live conversation, like a client timeout."""
+    before = slots(port)
+    if before["is_processing"]:
+        raise RuntimeError("Cancellation test requires an idle dedicated instance")
+    payload = json.dumps(dict(body, stream=True)).encode()
+    headers = (
+        f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n"
+    ).encode("ascii")
+    observed, started = False, time.monotonic()
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as peer:
+        try:
+            peer.sendall(headers + payload)
+            first = None
+            while time.monotonic() - started < timeout:
+                state = slots(port)
+                if state.get("id_task") != before.get("id_task") and state["is_processing"]:
+                    first = first or time.monotonic()
+                    if time.monotonic() - first >= after_s:
+                        evidence["at_disconnect"] = state
+                        observed = True
+                        break
+                elif first is not None:
+                    break  # Finished before the cancel point.
+                time.sleep(0.25)
+        finally:
+            try:
+                peer.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+    evidence["disconnect_wall_s"] = time.monotonic() - started
+    evidence["idle_after_disconnect"] = wait_idle(port, timeout)
     return observed
 
 
@@ -217,19 +253,114 @@ def extended_cases(args, results, run, check):
           bool(long_entries) and restored_counts["cache_n"] > LONG_THRESHOLD, **restored_counts)
     facts("extended restored content has expected facts", restored)
 
-    evidence = extended["cancel"] = {}
-    observed = cancel_prefill(args.port, long_body, args.request_timeout, evidence)
-    check("extended cancellation interrupts a verified partial long prefill", observed)
-    check("extended cancellation releases inference slot", not evidence["idle_after_disconnect"]["is_processing"])
-    health, _ = request(args.port, "/health", timeout=10)
-    check("extended health survives cancellation", health.get("status") == "ok")
-    retry = run("extended_cancel_retry", long_body)
-    retry_counts = token_counts(retry)
-    extended["retry_counts"] = retry_counts
-    check("extended retry resumes a completed checkpoint", retry_counts["cache_n"] >= 4096, **retry_counts)
-    check("extended retry retains measured long input length",
-          retry_counts["total_input_tokens"] == cold_counts["total_input_tokens"], **retry_counts)
-    facts("extended retry content has expected facts", retry)
+    if not args.branch_focus:
+        evidence = extended["cancel"] = {}
+        observed = cancel_prefill(args.port, long_body, args.request_timeout, evidence)
+        check("extended cancellation interrupts a verified partial long prefill", observed)
+        check("extended cancellation releases inference slot", not evidence["idle_after_disconnect"]["is_processing"])
+        health, _ = request(args.port, "/health", timeout=10)
+        check("extended health survives cancellation", health.get("status") == "ok")
+        retry = run("extended_cancel_retry", long_body)
+        retry_counts = token_counts(retry)
+        extended["retry_counts"] = retry_counts
+        check("extended retry resumes a completed checkpoint", retry_counts["cache_n"] >= 4096, **retry_counts)
+        check("extended retry retains measured long input length",
+              retry_counts["total_input_tokens"] == cold_counts["total_input_tokens"], **retry_counts)
+        facts("extended retry content has expected facts", retry)
+
+    # Production regression: a request sharing the long live prefix but with a
+    # different final user message parks the >49152-row live entry (reason=branch).
+    def branch_body(question):
+        body = copy.deepcopy(long_body)
+        body["messages"][-1]["content"] = question
+        return body
+
+    branch = extended["branch"] = {}
+    done = run("extended_branch_after_done",
+               branch_body("Report the current status, owner and color of CedarLong, in that order."))
+    branch["after_done"] = token_counts(done)
+    check("extended branch after done reuses the long prefix", branch["after_done"]["cache_n"] > LONG_THRESHOLD,
+          **branch["after_done"])
+    facts("extended branch after done content has expected facts", done)
+    # Diverge inside the history (~60%), as when a client rewrites older
+    # context. The long live branch must be parked, then resumable from the pool.
+    diverged = copy.deepcopy(long_body)
+    lines = diverged["messages"][0]["content"].split("\n")
+    cut = int(len(lines) * 0.6)
+    lines[cut:] = [x.replace("depot west", "depot east") for x in lines[cut:]]
+    diverged["messages"][0]["content"] = "\n".join(lines)
+    original = branch_body("CedarLong: report current status, owner and color.")
+
+    mid = run("extended_branch_mid_done", diverged)
+    branch["mid_done"] = token_counts(mid)
+    back = run("extended_branch_back_after_mid", original)
+    branch["back_after_mid"] = token_counts(back)
+    check("extended original survives a mid-history branch", branch["back_after_mid"]["cache_n"] > LONG_THRESHOLD,
+          **branch["back_after_mid"])
+    facts("extended back after mid content has expected facts", back)
+
+    evidence = branch["cancel"] = {}
+    rewritten = copy.deepcopy(long_body)
+    lines = rewritten["messages"][0]["content"].split(chr(10))
+    cut = int(len(lines) * 0.5)
+    lines[cut:] = [x.replace("depot west", "depot north") for x in lines[cut:]]
+    rewritten["messages"][0]["content"] = chr(10).join(lines)
+    branch["cancel_observed"] = cancel_live_prefill(args.port, rewritten, args.request_timeout, evidence)
+    check("extended live cancellation interrupted a running prefill", branch["cancel_observed"], **evidence)
+    after = run("extended_branch_after_cancel", original)
+    branch["after_cancel"] = token_counts(after)
+    check("extended original survives a cancelled mid-history branch", branch["after_cancel"]["cache_n"] > LONG_THRESHOLD,
+          **branch["after_cancel"])
+    facts("extended branch after cancel content has expected facts", after)
+
+
+def pic_body(system, shared, tail):
+    return {"model": "default", "messages": [
+        {"role": "system", "content": system},
+        {"role": "user", "content": shared},
+        {"role": "assistant", "content": "Noted."},
+        {"role": "user", "content": tail}],
+        "temperature": 0, "seed": 7, "max_tokens": 24,
+        "chat_template_kwargs": {"enable_thinking": False}}
+
+
+def pic_cases(args, results, run, check):
+    """Exercise the approximate server-side segment path.
+
+    A cold request builds one message-aligned segment; a second request whose
+    system message diverges early but repeats the same message body must reuse
+    it. Output equality with a non-PIC run is NOT asserted: the path is
+    approximate by design.
+    """
+    port = args.port
+    pic = results["pic"] = {}
+    shared = "\n".join(
+        f"Observation {i:04d}: depot west parcel {i:04d} was scanned and its seal is intact; "
+        "this observation is background only and is not a current status."
+        for i in range(90)
+    )
+    tail = "Reply with the single word READY and nothing else."
+    cold_body = pic_body("PIC scenario cold. Archive rows are background only.", shared, tail)
+    warm_body = pic_body("PIC scenario warm. Archive rows are background only.", shared, tail)
+    cold = run("pic_cold", dict(cold_body, cache_reset=True, pool_reset=True), port=port)
+    pic["cold"] = {"prompt_n": cold.get("timings", {}).get("prompt_n"),
+                   "cache_n": cold.get("timings", {}).get("cache_n"),
+                   "prompt_ms": cold.get("timings", {}).get("prompt_ms"),
+                   "content": cold["choices"][0]["message"].get("content")}
+    warm = run("pic_reuse", warm_body, port=port)
+    pic["warm"] = {"prompt_n": warm.get("timings", {}).get("prompt_n"),
+                   "cache_n": warm.get("timings", {}).get("cache_n"),
+                   "prompt_ms": warm.get("timings", {}).get("prompt_ms"),
+                   "content": warm["choices"][0]["message"].get("content")}
+    check("pic cold request answered", isinstance(pic["cold"]["content"], str) and pic["cold"]["content"].strip() != "")
+    check("pic reuse request answered", isinstance(pic["warm"]["content"], str) and pic["warm"]["content"].strip() != "")
+    # timings.prompt_n is the total input, not the evaluated subset, so the
+    # reduction shows up in prefill time. The controller separately asserts that
+    # the server log recorded an actual PIC hit.
+    cold_ms = pic["cold"]["prompt_ms"] or 0.0
+    warm_ms = pic["warm"]["prompt_ms"] or 0.0
+    check("pic reuse lowers prefill time", 0 < warm_ms < cold_ms,
+          cold_prompt_ms=cold_ms, warm_prompt_ms=warm_ms)
 
 def eviction_cases(args, results, run, check):
     port = args.port
@@ -271,6 +402,167 @@ def eviction_cases(args, results, run, check):
     check("extended evicted branch content has expected facts", fact_content(replay, FACTS), expected_content=" ".join(FACTS))
 
 
+# ---------------------------------------------------------------- PIC quality
+# F3c gate. The same fixed request list is graded on an exact-only server
+# (--kvmem-pic off) and on a PIC server (--kvmem-pic on). Each PIC case repeats
+# the baseline case body but diverges in the system line, so exact-prefix reuse
+# cannot cover the shared body and only a PIC segment splice can. The phase
+# writes raw grades; the controller compares the two phases so no approximation
+# verdict is made by the instance being tested.
+QUALITY_TRUTH = {"status": "approved", "owner": "Lin", "color": "green"}
+QUALITY_FALSE = {"status": "rejected", "owner": "Nobody", "color": "red"}
+
+QUALITY_PROMPTS = {
+    "tool_and_schema": (
+        "Call the tool lookup_status exactly once with project=\"Cedar\". Do not answer in prose.", "tool"),
+    "facts_negation": (
+        "The archive contains a superseded record and an authoritative one. Report the authoritative "
+        "current status, owner and color as exactly three space separated values, nothing else.", "facts"),
+    "long_memory": (
+        "Report the authoritative current status, owner and color recorded in the shared body as exactly "
+        "three space separated values, nothing else.", "facts"),
+    "position_move": (
+        "Report the authoritative current status, owner and color recorded in the shared body as exactly "
+        "three space separated values, nothing else.", "facts"),
+    "repeat_emphasis": (
+        "Report the REQUIRED OUTPUT token from the shared body. Output that token alone.", "delta"),
+    "plain_chat": (
+        "In one short friendly sentence, say hello and confirm you are ready to help.", "chat"),
+}
+
+
+def quality_doc(category, index, rows=54):
+    """Identical for both phases; only the system line differs between them."""
+    lines = [f"Archive block {category} case {index}. The rows below are background only."]
+    planted = {
+        "facts_negation": 4,
+        "long_memory": rows - 6,
+        "position_move": (index % 3) * (rows // 3) + 2,
+        "repeat_emphasis": rows - 3,
+    }.get(category, rows // 2)
+    for i in range(rows):
+        if i == planted:
+            if category == "facts_negation":
+                lines.append(
+                    f"Row {i:03d}: the earlier note that the current status is {QUALITY_FALSE['status']} "
+                    f"with owner {QUALITY_FALSE['owner']} is superseded and must NOT be reported.")
+                lines.append(
+                    f"Row {i:03d}b: the authoritative current record is status={QUALITY_TRUTH['status']}, "
+                    f"owner={QUALITY_TRUTH['owner']}, color={QUALITY_TRUTH['color']}.")
+            elif category == "repeat_emphasis":
+                lines.append(
+                    f"Row {i:03d}: REQUIRED OUTPUT token is DELTA-{index:02d}. "
+                    f"Report DELTA-{index:02d} and nothing else.")
+            else:
+                lines.append(
+                    f"Row {i:03d}: the authoritative current record for this case is "
+                    f"status={QUALITY_TRUTH['status']}, owner={QUALITY_TRUTH['owner']}, "
+                    f"color={QUALITY_TRUTH['color']}.")
+        else:
+            lines.append(
+                f"Row {i:03d}: parcel {i:03d} was scanned at depot west and its seal is intact; "
+                "this inventory observation is unrelated and is not a current status.")
+    return "\n".join(lines)
+
+
+def quality_body(category, index, phase):
+    prompt, _ = QUALITY_PROMPTS[category]
+    guard = ("Respond only from the shared body above. Ignore anything that is not the authoritative record. "
+             "Follow the output format exactly; do not add labels, prose or explanations. " * 3)
+    return {"model": "default", "messages": [
+        {"role": "system", "content": f"Quality scenario {category} phase {phase}. Archive rows are background only."},
+        {"role": "user", "content": quality_doc(category, index)},
+        {"role": "assistant", "content": "Noted."},
+        {"role": "user", "content": prompt + "\n" + guard}],
+        "temperature": 0, "seed": 7, "max_tokens": 32,
+        "tools": [{"type": "function", "function": {"name": "lookup_status", "description": "Get item status",
+                   "parameters": {"type": "object", "properties": {"project": {"type": "string"}},
+                                  "required": ["project"]}}}],
+        "chat_template_kwargs": {"enable_thinking": False}}
+
+
+def quality_grade(category, index, value):
+    message = value["choices"][0]["message"]
+    content = message.get("content") or ""
+    words = re.findall(r"[a-z]+", content.casefold())
+    truth = [value.casefold() for value in QUALITY_TRUTH.values()]
+    if category == "tool_and_schema":
+        calls = message.get("tool_calls") or []
+        ok = len(calls) == 1 and calls[0].get("function", {}).get("name") == "lookup_status"
+        args = {}
+        if ok:
+            try:
+                args = json.loads(calls[0]["function"].get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            ok = args.get("project") == "Cedar"
+        return ok, {"tool_name": (calls[0].get("function", {}).get("name") if calls else None),
+                    "tool_args": args, "content": content[:120]}
+    if category == "facts_negation":
+        bad = [word for word in (QUALITY_FALSE["status"], QUALITY_FALSE["owner"], QUALITY_FALSE["color"])
+               if word.casefold() in content.casefold()]
+        return words == truth and not bad, {"words": words, "superseded_leak": bad}
+    if category in ("long_memory", "position_move"):
+        return words == truth, {"words": words}
+    if category == "repeat_emphasis":
+        return content.strip().casefold() == f"delta-{index:02d}".casefold(), {"content": content[:120]}
+    if category == "plain_chat":
+        contamination = [token for token in (*truth, QUALITY_FALSE["status"])
+                         if token.casefold() in content.casefold()]
+        return bool(words) and not contamination, {"content": content[:120], "contamination": contamination}
+    raise ValueError("Unknown quality category")
+
+
+def quality_phase(args, results, run, check):
+    """One server phase only. Writes raw per-case grades; the controller decides."""
+    port = args.port
+    phase = results["quality_phase"] = {
+        "phase": args.quality_phase, "pic": args.pic, "categories": list(QUALITY_PROMPTS),
+        "cases_per_category": args.quality_cases, "plan_target_per_category": 20,
+        "answers": {},
+    }
+    answers = phase["answers"]
+    for category in QUALITY_PROMPTS:
+        answers[category] = []
+        for index in range(1, args.quality_cases + 1):
+            record = {"index": index}
+            body = quality_body(category, index, "graded")
+            try:
+                if args.pic == "on":
+                    # The seed carries a different system line and exists only to
+                    # build the segment on a clean evaluation. The graded request
+                    # is byte-identical to the graded baseline request, so a PIC
+                    # hit is still required (no exact checkpoint for that system
+                    # line exists) but nothing else differs between the phases.
+                    seed = run(f"quality_{category}_{index}_seed",
+                               dict(quality_body(category, index, "seed"), cache_reset=True, pool_reset=True),
+                               port=port)
+                    if index == 1:
+                        phase.setdefault("seed_prompt_ms", {})[category] = seed.get("timings", {}).get("prompt_ms")
+                    value = run(f"quality_{category}_{index}_pic", body, port=port)
+                else:
+                    value = run(f"quality_{category}_{index}_exact",
+                                dict(body, cache_reset=True, pool_reset=True), port=port)
+                ok, detail = quality_grade(category, index, value)
+                record.update(correct=ok, grade=detail,
+                              prompt_ms=value.get("timings", {}).get("prompt_ms"))
+            except Exception as error:
+                record.update(correct=False, error=type(error).__name__)
+            answers[category].append(record)
+    phase["correct_by_category"] = {
+        category: sum(1 for r in rows if r.get("correct") is True) for category, rows in answers.items()}
+    check(f"quality phase {args.quality_phase} completed every case",
+          all(len(rows) == args.quality_cases for rows in answers.values()))
+
+
+def percentile(values, rank):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((rank / 100.0) * len(ordered) + 0.5)) - 1))
+    return round(ordered[index], 3)
+
+
 def gpu_reuse_snapshot(port, timeout, expected):
     pool, _ = request(port, "/kvmem/pool", timeout=timeout)
     stats = pool.get("resident_stats", {})
@@ -306,13 +598,27 @@ def main():
     modes.add_argument("--eviction-only", action="store_true", help="Only eviction cases on this --port; requires --kvmem-pool-max 1")
     parser.add_argument("--expect-gpu-reuse", nargs="?", const="on", choices=("on", "off"),
                         help="Assert actual resident counter deltas, not just configuration")
+    parser.add_argument("--branch-focus", action="store_true",
+                        help="With --extended: skip the reset cancel/retry and run only branch coverage")
     parser.add_argument("--long-records", type=int, default=2800, help="Long fixture rows; actual length is checked using timings")
+    parser.add_argument("--pic", choices=("on", "off"), help="Server was started with --kvmem-pic; run the segment-reuse cases")
+    parser.add_argument("--quality-phase", choices=("baseline", "pic"),
+                        help="Run one F3c quality phase only; the controller compares phases")
+    parser.add_argument("--quality-cases", type=int, default=2, help="Cases per category (plan target is 20)")
     parser.add_argument("--request-timeout", type=float, default=360, help="Seconds per request; allows 150s cold long prefill")
     args = parser.parse_args()
     if args.port == 18200:
         parser.error("Refusing production port")
     if not 1 <= args.port <= 65535 or args.request_timeout <= 0 or args.long_records <= 0:
         parser.error("Port, request timeout and long-records must be positive and valid")
+    if args.quality_phase == "pic" and args.pic != "on":
+        parser.error("--quality-phase pic requires --pic on")
+    if args.quality_phase == "baseline" and args.pic == "on":
+        parser.error("--quality-phase baseline requires a PIC-off server")
+    if args.quality_phase and args.pic is None:
+        parser.error("--quality-phase requires --pic to state the server mode")
+    if not 1 <= args.quality_cases <= 20:
+        parser.error("--quality-cases must be between 1 and 20")
     base, continuation, other = fixture()
     results = {"requests": {}, "checks": []}
     if args.expect_gpu_reuse is not None:
@@ -343,6 +649,12 @@ def main():
 
     completed = False
     try:
+        if args.quality_phase:
+            # A quality phase is a complete run of its own; the standard
+            # synthetic matrix is unrelated and must not consume its window.
+            quality_phase(args, results, run, check)
+            completed = True
+            return 0 if all(x["passed"] for x in results["checks"]) else 1
         if args.eviction_only:
             eviction_cases(args, results, run, check)
             if args.expect_gpu_reuse is not None:
@@ -376,6 +688,10 @@ def main():
         results["pool_final"] = final_pool
         if args.extended:
             extended_cases(args, results, run, check)
+        if args.quality_phase:
+            quality_phase(args, results, run, check)
+        elif args.pic == "on":
+            pic_cases(args, results, run, check)
         if args.expect_gpu_reuse is not None:
             check_gpu_reuse(args, results, check)
         completed = True

@@ -56,6 +56,31 @@ GDN transitions. Building runs synchronously inside the request (192
 independent scans). Becoming beneficial needs message-level segments, building
 off the request path, and batched GPU-resident compose/scan.
 
+## Pool: deep branches and checkpoint retention
+
+A request that shares only an early part of the live conversation used to drop
+the rest when the dropped span had no checkpoint exactly on a message-start
+token, e.g. one large system message followed by one user message. Returning to
+the original then recomputed tens of thousands of tokens. Dropping at least
+16384 rows now always parks the live conversation first; the per-turn rewritten
+tail of a normal continuation stays far below that.
+
+A parked entry keeps `--kvmem-pool-ckpts` recurrent checkpoints (default 5). It
+now always keeps the oldest one, the Q anchor (or the newest row without one)
+and the first checkpoint of the current turn. The remaining slots drop the
+checkpoint closest to its neighbours, non-message rows first, so a later rewrite
+of older context can resume inside the history instead of near the start.
+
+Server logs add `kvmem pool: route` (why a dropped live tail is or is not
+parked) and `kvmem pool: stash_phases` (stash timings, page faults, working set
+and commit). With KVMEM_TRACE, `KVMEM_STASH_TAKE` breaks down the adapter side.
+
+`scripts/cache-revision-regression.py --extended --branch-focus` covers a tail
+branch, a completed mid-history branch, a cancelled mid-history branch and the
+return to the original each time. Measured on V100 with a 72,892-token fixture:
+returning after a mid-history branch went from 75.9 s to 1.5 s, returning after
+a cancelled one from 94.7 s to 0.7 s, and the tail branch stayed at 1.0 s.
+
 ## Validation
 
 The source baseline was built for SM70 with MSVC and CUDA 12.9. The deployed

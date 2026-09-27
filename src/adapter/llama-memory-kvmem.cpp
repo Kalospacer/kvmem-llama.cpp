@@ -3717,10 +3717,13 @@ std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_r
     // Packed K/V of every resident block must be on the host before the GPU
     // pages are dropped. Decode and retrieval pin the working set, which
     // disables the async harvest, so harvest explicitly here.
+    const int64_t st0 = ggml_time_us();
     decode_mean_flush();
     decode_mean_discard();
+    const int64_t st_mean = ggml_time_us();
     harvest_flush();
     harvest_gpu_v_commit();
+    const int64_t st_flush = ggml_time_us();
     std::vector<uint32_t> resident;
     for (const auto & b : store.blocks()) {
         if (b.gpu_slot < 0 || b.n_tokens == 0) continue;
@@ -3728,7 +3731,9 @@ std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_r
         harvest_gpu_v(b.block_id);
     }
     harvest_gpu_v_commit();
+    const int64_t st_harvest = ggml_time_us();
     if (mtp_) mtp_->harvest_resident_v();
+    const int64_t st_mtp = ggml_time_us();
 
     uint32_t rows = total;
     for (const auto & b : store.blocks()) {
@@ -3750,6 +3755,7 @@ std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_r
     }
     if (rows == 0) return nullptr;
 
+    const int64_t st_check = ggml_time_us();
     auto stash = std::make_unique<llama_kvmem_stash>();
     stash->rows = rows;
     stash->approximate_from = approximate_from_;
@@ -3757,7 +3763,9 @@ std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_r
     // likewise allocates first; after it succeeds the swaps cannot throw.
     stash->runtime = std::make_unique<kvmem::KvMemRuntime>(runtime_->config(), &backend_);
     stash->raw = std::make_unique<kvmem::RawKvStore>(raw_->config());
+    const int64_t st_alloc = ggml_time_us();
     publish_resident_tags(rows);
+    const int64_t st_tags = ggml_time_us();
     if (mtp_) stash->mtp_raw = mtp_->take_raw();
     runtime_.swap(stash->runtime);
     raw_.swap(stash->raw);
@@ -3772,6 +3780,7 @@ std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_r
         ss.set_block_io_in_flight(id, false);
     }
     ss.clear_working_set();
+    const int64_t st_move = ggml_time_us();
     try {
         if (!stash->truncate_to(rows)) {
             stash_reset_empty();
@@ -3781,7 +3790,14 @@ std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_r
         stash_reset_empty();
         throw;
     }
+    const int64_t st_trunc = ggml_time_us();
     stash_reset_empty(pool_preserve_);
+    kvmem_diag("KVMEM_STASH_TAKE mean=%.1f flush=%.1f harvest_v=%.1f mtp=%.1f check=%.1f alloc=%.1f tags=%.1f "
+            "move=%.1f truncate=%.1f reset=%.1f resident=%zu rows=%u blocks=%u\n",
+            (st_mean - st0) / 1e3, (st_flush - st_mean) / 1e3, (st_harvest - st_flush) / 1e3, (st_mtp - st_harvest) / 1e3,
+            (st_check - st_mtp) / 1e3, (st_alloc - st_check) / 1e3, (st_tags - st_alloc) / 1e3, (st_move - st_tags) / 1e3,
+            (st_trunc - st_move) / 1e3, (ggml_time_us() - st_trunc) / 1e3, stash->resident.size(), rows,
+            stash->runtime->store().block_count());
     return stash;
 }
 

@@ -43,6 +43,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #endif
 
 using json = nlohmann::json;

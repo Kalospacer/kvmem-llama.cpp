@@ -371,12 +371,18 @@ static int pool_resume_row(const kvmem_prompt & prompt, int cap, const kvmem_pro
 // Would dropping rows (lcp, rows] lose something a later request can resume?
 // A checkpoint at a message start means a later turn of that branch lands
 // there; the rewritten tail of the current turn only holds query/end rows.
+// A per-turn rewritten tail is a few thousand rows. Dropping far more than that
+// abandons history (a client rewrote older context), even when the dropped span
+// holds no message-start checkpoint, e.g. one huge system message.
+static constexpr int kPoolDeepBranchRows = 16384;
+
 static bool pool_branch_worth(const ServerState & st, const kvmem_prompt & cached, int rows,
                               const std::vector<MultimodalCheckpoint> & checkpoints, int lcp, bool unrelated) {
     if (rows < st.pool_min_rows || rows - std::max(lcp, 0) < st.pool_min_gain) return false;
+    const bool deep = rows - std::max(lcp, 0) >= kPoolDeepBranchRows;
     for (const auto & checkpoint : checkpoints) {
         if (!checkpoint.data || checkpoint.row <= lcp || checkpoint.row > rows) continue;
-        if (unrelated && checkpoint.row >= st.pool_min_rows) return true;
+        if ((unrelated || deep) && checkpoint.row >= st.pool_min_rows) return true;
         if (checkpoint.row < (int) cached.tokens.size() && cached.tokens[checkpoint.row] == st.mm_msg_token) return true;
     }
     return false;
@@ -631,16 +637,47 @@ struct PoolPreserveScope {
 
 // Move the live conversation into the pool. The live memory is left empty
 // (llama_memory_clear'ed by memory_clear_all). Returns the new entry or null.
+// Page faults and working set around pool operations: a slow stash can be host
+// paging rather than transfer work.
+struct PoolMemProbe {
+    unsigned long long faults = 0, working_mb = 0, pagefile_mb = 0;
+    static PoolMemProbe now() {
+        PoolMemProbe p;
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS pmc{};
+        if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+            p.faults = pmc.PageFaultCount;
+            p.working_mb = pmc.WorkingSetSize >> 20;
+            p.pagefile_mb = pmc.PagefileUsage >> 20;
+        }
+#endif
+        return p;
+    }
+};
+
 static PoolEntry * pool_stash_live(ServerState & st, const char * reason) {
     const auto started = std::chrono::steady_clock::now();
-    if (!st.mm_committed || !st.cached_prompt || st.cached_prompt->has_media() || st.mm_live_row <= 0) return nullptr;
+    const auto mem0 = PoolMemProbe::now();
+    const auto ms_since = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+    };
+    if (!st.mm_committed || !st.cached_prompt || st.cached_prompt->has_media() || st.mm_live_row <= 0) {
+        LOG_WRN("srv    kvmem pool: stash skipped committed=%d cached=%d live_rows=%d reason=%s\n",
+                (int) st.mm_committed, (int) (st.cached_prompt != nullptr), st.mm_live_row, reason);
+        return nullptr;
+    }
     // Allocate the owner before take so allocation failure cannot leak a detached stash.
     auto e = std::make_unique<PoolEntry>();
     uint32_t rows = 0;
     llama_synchronize(st.ctx);
     if (st.spec.ctx_dft) llama_synchronize(st.spec.ctx_dft);
+    const double sync_ms = ms_since(started);
+    const auto t_preserve = std::chrono::steady_clock::now();
     PoolPreserveScope preserve(st.pool_gpu_reuse);
+    const double preserve_ms = ms_since(t_preserve);
+    const auto t_take = std::chrono::steady_clock::now();
     e->stash = llama_kvmem_stash_take((uint32_t) st.mm_live_row, &rows);
+    const double take_ms = ms_since(t_take);
     if (!e->stash) {
         LOG_WRN("srv    kvmem pool: stash failed live_rows=%d reason=%s\n", st.mm_live_row, reason);
         preserve.finish(false);
@@ -672,24 +709,68 @@ static PoolEntry * pool_stash_live(ServerState & st, const char * reason) {
         }
         if (query_anchor < 0) e->query.reset();
     }
-    // A later turn of this conversation resumes at a message start; the rows
-    // inside the rewritten tail (query, eval_end, commit) are rarely reused.
-    // Drop those first, oldest first; protect the oldest entry and the Q anchor.
+    // A later turn of this conversation resumes at a message start, and a
+    // rewrite of older context resumes somewhere inside the history. Keep the
+    // oldest entry, the Q anchor (else the newest row) and the first row of the
+    // current turn, where a rewritten last message resumes. Otherwise drop the
+    // checkpoint with the closest neighbours, non-message rows first, so the
+    // survivors stay spread over the conversation instead of the rewritten tail.
+    const auto & cached_tokens = st.cached_prompt->tokens;
     auto msg_start = [&](const MultimodalCheckpoint & c) {
-        return c.row < (int) st.cached_prompt->tokens.size() && st.cached_prompt->tokens[c.row] == st.mm_msg_token;
+        return c.row < (int) cached_tokens.size() && cached_tokens[c.row] == st.mm_msg_token;
     };
+    // The last message token opens the generated reply; the one before opens the turn.
+    int turn_start = -1;
+    for (int i = (int) cached_tokens.size() - 1, seen = 0; i >= 0; --i) {
+        if (cached_tokens[i] == st.mm_msg_token && ++seen == 2) {
+            turn_start = i;
+            break;
+        }
+    }
+    int turn_row = -1;
+    for (const auto & c : kept) {
+        if (turn_start >= 0 && c.row >= turn_start) {
+            turn_row = c.row;
+            break;
+        }
+    }
     while ((int) kept.size() > st.pool_ckpts) {
-        auto victim = std::find_if(kept.begin() + 1, kept.end(),
-            [&](const auto & c) { return c.row != query_anchor && !msg_start(c); });
-        if (victim == kept.end()) victim = std::find_if(kept.begin() + 1, kept.end(),
-            [&](const auto & c) { return c.row != query_anchor; });
-        if (victim == kept.end()) break; // At most two protected entries; CLI requires cap >= 2.
-        kept.erase(victim);
+        auto protect = [&](size_t i) {
+            return i == 0 || kept[i].row == query_anchor || kept[i].row == turn_row ||
+                (query_anchor < 0 && i + 1 == kept.size());
+        };
+        size_t victim = kept.size();
+        int best_gap = INT_MAX;
+        for (int pass = 0; pass < 2 && victim == kept.size(); ++pass) {
+            for (size_t i = 1; i < kept.size(); ++i) {
+                if (protect(i) || (pass == 0 && msg_start(kept[i]))) continue;
+                const int gap = i + 1 < kept.size() ? kept[i + 1].row - kept[i - 1].row : kept[i].row - kept[i - 1].row;
+                if (gap < best_gap) {
+                    best_gap = gap;
+                    victim = i;
+                }
+            }
+        }
+        if (victim == kept.size()) {
+            // Only protected rows are left (small cap): keep the anchor, drop the turn row first.
+            auto it = std::find_if(kept.begin() + 1, kept.end(), [&](const auto & c) { return c.row == turn_row && c.row != query_anchor; });
+            if (it == kept.end()) it = std::find_if(kept.begin() + 1, kept.end(), [&](const auto & c) { return c.row != query_anchor; });
+            if (it == kept.end()) break;
+            victim = (size_t) (it - kept.begin());
+        }
+        kept.erase(kept.begin() + (std::ptrdiff_t) victim);
     }
     e->checkpoints = std::move(kept);
     e->bytes = llama_kvmem_stash_bytes(e->stash);
     e->created = e->last_used = std::chrono::steady_clock::now();
+    const auto t_clear = std::chrono::steady_clock::now();
     memory_clear_all(st);
+    const double clear_ms = ms_since(t_clear);
+    const auto mem1 = PoolMemProbe::now();
+    LOG_INF("srv    kvmem pool: stash_phases id=%llu sync=%.1f preserve=%.1f take=%.1f clear=%.1f "
+            "faults=%llu ws_mb=%llu->%llu pagefile_mb=%llu->%llu live_rows=%d\n",
+            (unsigned long long) e->id, sync_ms, preserve_ms, take_ms, clear_ms, mem1.faults - mem0.faults,
+            mem0.working_mb, mem1.working_mb, mem0.pagefile_mb, mem1.pagefile_mb, st.mm_live_row);
     LOG_INF("srv    kvmem pool: stash id=%llu rows=%d ckpts=%zu query=%d query_anchor=%d legacy_stash_bytes=%.2fGB ms=%.1f reason=%s entries=%zu\n",
             (unsigned long long) e->id, e->rows, e->checkpoints.size(), (int) (e->query != nullptr), query_anchor, e->bytes / 1073741824.0,
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
@@ -801,6 +882,20 @@ static void multimodal_pool_route(ServerState & st, const kvmem_prompt & prompt,
         }
         const bool live_valuable = st.cached_prompt && !st.cached_prompt->has_media() &&
             pool_branch_worth(st, *st.cached_prompt, st.mm_live_row, st.mm_checkpoints, live_lcp, live_row < 0);
+        if (st.mm_live_row - std::max(live_lcp, 0) >= st.pool_min_gain) {
+            // The request drops a large live tail: record why it is (not) parked.
+            std::string after;
+            for (const auto & c : st.mm_checkpoints) {
+                if (c.row <= live_lcp) continue;
+                const bool msg = st.cached_prompt && c.row < (int) st.cached_prompt->tokens.size() &&
+                    st.cached_prompt->tokens[c.row] == st.mm_msg_token;
+                after += std::to_string(c.row) + (msg ? "m" : "") + (c.data ? "" : "!") + ",";
+            }
+            LOG_INF("srv    kvmem pool: route live_rows=%d live_lcp=%d live_row=%d valuable=%d committed=%d "
+                    "cached=%zu best_row=%d entries=%zu ckpts_after_lcp=[%s]\n",
+                    st.mm_live_row, live_lcp, live_row, (int) live_valuable, (int) st.mm_committed,
+                    st.cached_prompt ? st.cached_prompt->tokens.size() : (size_t) 0, best_row, st.pool.size(), after.c_str());
+        }
         if (best < st.pool.size() && best_row >= std::max(live_row, 0) + st.pool_min_gain) {
             const PoolEntry * target = st.pool[best].get();
             if (live_valuable && pool_stash_live(st, "switch")) {
