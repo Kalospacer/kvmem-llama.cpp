@@ -24,6 +24,7 @@ struct llama_memory_params;
 struct ggml_tensor;
 class llama_memory_recurrent;
 class llama_memory_kvmem_mtp;
+namespace kvmem_pic { struct kv_splice_plan; }
 
 // Bounded block-slot pool over a llama_kv_cache.
 //
@@ -206,6 +207,16 @@ public:
     void note_gpu_write(int32_t slot) noexcept;
     void note_external_kv_write();
     const llama_kvmem_resident_stats & resident_stats() const { return resident_stats_; }
+
+    // Bind a trusted configuration generation BEFORE preparing any PIC plan.
+    // Rebinding a different nonzero generation requires empty live memory.
+    bool pic_bind_epoch(uint64_t epoch, std::string & error);
+    uint64_t pic_epoch() const { return pic_epoch_; }
+    bool pic_poisoned() const { return pic_poisoned_; }
+    bool pic_approximate() const { return approximate_from_ != UINT32_MAX; }
+    // Caller fences both graph contexts and owns a full KV/recurrent/carry/Q
+    // rollback transaction. A post-write failure poisons memory until full clear.
+    bool pic_kv_commit(const kvmem_pic::kv_splice_plan & plan, std::string & error);
 
 private:
     friend struct kvmem_transfer_test_access;
@@ -461,6 +472,9 @@ private:
     RetrPerf retr_;
     std::vector<std::vector<float>> q_sum_;
     std::vector<uint32_t> q_count_;
+    uint64_t pic_epoch_ = 0;
+    uint32_t approximate_from_ = UINT32_MAX;
+    bool pic_poisoned_ = false;
 };
 
 struct llama_kvmem_stash {
@@ -470,6 +484,7 @@ struct llama_kvmem_stash {
     std::vector<llama_memory_kvmem::RowPosition> row_positions;
     std::vector<uint32_t> resident; // block ids that were on GPU when stashed
     uint32_t rows = 0;
+    uint32_t approximate_from = UINT32_MAX;
     // Host-only: never release slots belonging to the active live memory.
     bool truncate_to(uint32_t prefix_rows);
     void append_allocations(std::vector<std::pair<const void *, size_t>> & out) const;

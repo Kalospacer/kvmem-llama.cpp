@@ -190,7 +190,7 @@ static void print_usage(const char * argv0) {
             "  --no-kvmem-pool-query      disable parked query save/import (live query reuse remains enabled)\n"
             "  --kvmem-pool-restore MODE  full | prefix (default prefix)\n"
             "  --kvmem-pool-copy MODE     deep | cow (default cow; fixed at startup)\n"
-            "  --kvmem-pic MODE           off | on (default off; on unavailable: integration incomplete)\n"
+            "  --kvmem-pic MODE           off | on (default off; server-side segment reuse, approximate)\n"
             "  --pool-gpu-reuse MODE      on | off (default off; experimental same-slot GPU reuse)\n"
             "  Environment: KVMEM_WINDOWS_RESOURCE_POLICY=normal|inherit (default inherit)\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
@@ -260,6 +260,8 @@ struct MultimodalCheckpointAccounting {
     size_t live_bytes = 0;
     size_t peak_bytes = 0;
 };
+
+struct KvmemPicServer; // defined in kvmem-pic-server.h
 
 struct MultimodalCheckpointData {
     MultimodalCheckpointData() = default;
@@ -416,6 +418,11 @@ struct ServerState {
     std::string last_user_text;
     std::string turn_last_user;
     int last_n_gen = 0;
+    // PIC (server-side transparent segment reuse). Off by default; keeps the
+    // client request, tokenization and positions unchanged when enabled.
+    bool pic_enabled = false;
+    std::shared_ptr<KvmemPicServer> pic;
+    bool mm_approximate = false;
 };
 
 struct StreamIo {
@@ -671,6 +678,18 @@ static int decode_span_maybe_spec(ServerState & st, const llama_token * toks, in
 }
 
 #include "kvmem-multimodal-server.h"
+
+// Unique bytes already held by the exact cache (live + parked pool entries).
+// PIC admission uses it so experimental segments never evict exact entries.
+static size_t pic_exact_cache_bytes(ServerState & st) {
+    if (!st.kparams.enabled) return 0;
+    const size_t budget = (size_t) (st.pool_gb*1073741824.0);
+    try {
+        return pool_memory(st).totals().combined;
+    } catch (...) {
+        return budget;
+    }
+}
 
 static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_token> & prompt,
                                  StreamIo * io = nullptr, int * n_cache_hit = nullptr) {
@@ -1908,14 +1927,11 @@ int main(int argc, char ** argv) {
             st.pool_gpu_reuse = eq(mode, "on");
         } else if (eq(arg, "--kvmem-pic")) {
             const char * mode = need(arg);
-            if (eq(mode, "on")) {
-                fprintf(stderr, "KVMEM_STARTUP_ERROR PIC server integration is incomplete: adapter pic_kv_commit is unavailable; use --kvmem-pic off\n");
+            if (!eq(mode, "on") && !eq(mode, "off")) {
+                fprintf(stderr, "invalid --kvmem-pic (want on|off)\n");
                 return 1;
             }
-            if (!eq(mode, "off")) {
-                fprintf(stderr, "invalid --kvmem-pic (want off|on; on is not available in this build)\n");
-                return 1;
-            }
+            st.pic_enabled = eq(mode, "on");
         } else if (eq(arg, "--kvmem-query-max-tokens")) {
             st.query_max_tokens = kvmem_cli_int(arg, need(arg));
             if (st.query_max_tokens <= 0) {
@@ -2195,6 +2211,7 @@ int main(int argc, char ** argv) {
     cparams.n_seq_max = 1;
     cparams.type_k = st.cache_type_k;
     cparams.type_v = st.cache_type_v;
+    pic_initialize(st, cparams);
     if (st.spec_mtp) {
         const uint32_t n_out = (uint32_t) (1 + std::max(0, st.spec_n_max));
         cparams.n_outputs_max = n_out;

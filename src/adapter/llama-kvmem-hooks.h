@@ -143,6 +143,7 @@ struct llama_kvmem_turn_spans {
 struct llama_kvmem_query_state {
     std::vector<std::vector<float>> sum;
     std::vector<uint32_t> count;
+    bool approximate = false;
 };
 struct llama_kvmem_attention_view {
     uint64_t epoch = 0;
@@ -213,6 +214,15 @@ struct llama_kvmem_resident_stats {
     uint64_t skipped_mtp_bytes = 0;
 };
 LLAMA_API bool llama_kvmem_get_resident_stats(llama_kvmem_resident_stats & out);
+
+namespace kvmem_pic { struct kv_splice_plan; }
+LLAMA_API bool llama_kvmem_pic_bind_epoch(uint64_t epoch, std::string & error);
+LLAMA_API bool llama_kvmem_pic_kv_commit(const kvmem_pic::kv_splice_plan & plan, std::string & error);
+// Diagnostic only: publish the last commit's upload call/byte counts.
+LLAMA_API void llama_kvmem_pic_report_uploads(uint64_t calls, uint64_t bytes);
+LLAMA_API bool llama_kvmem_pic_is_approximate();
+LLAMA_API bool llama_kvmem_pic_is_poisoned();
+LLAMA_API bool llama_kvmem_stash_is_approximate(const llama_kvmem_stash * stash);
 
 // Append non-owning (allocation identity, capacity bytes) entries; deduplicate
 // identities across ALL retained stash/live owners for unique/reclaimable bytes.

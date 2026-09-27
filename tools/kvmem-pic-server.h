@@ -1,8 +1,7 @@
 #pragma once
 
-// Work in progress, excluded from this build. No PIC server capability is shipped.
-// Missing adapter commit and end-to-end validation; CLI rejects --kvmem-pic on.
-#if 0
+// Server-side transparent PIC orchestration. Off by default, enabled with
+// --kvmem-pic on. The client request, tokenization and positions are unchanged.
 
 // Included after multimodal_checkpoint/restore/decode_span, before pool accounting.
 #include "llama-kvmem-pic-capture.h"
@@ -64,6 +63,7 @@ struct KvmemPicServer {
         if (cpu) ggml_backend_free(cpu);
     }
 };
+
 
 static void pic_require(bool ok, const char * error) {
     if (!ok) throw std::runtime_error(error);
@@ -547,8 +547,11 @@ static bool pic_splice_body(ServerState & st, const kvmem_pic::segment_match & m
     const auto started = std::chrono::steady_clock::now();
     pic_require(st.mm_live_row == begin && end > begin, "PIC body cursor mismatch");
     PicLiveTransaction transaction(st);
+    double phase_begin = 0, phase_capture = 0, phase_compose = 0, phase_prepare = 0, phase_validate = 0,
+           phase_commit = 0, phase_install = 0;
     try {
         transaction.begin(true);
+        const auto t_after_begin = std::chrono::steady_clock::now();
         auto & hybrid = pic_hybrid(st);
         auto & adapter = *hybrid.attn_kvmem();
         pic_sync(st);
@@ -557,6 +560,7 @@ static bool pic_splice_body(ServerState & st, const kvmem_pic::segment_match & m
         kvmem_pic::recurrent_state state;
         std::string error;
         pic_check(kvmem_pic::pic_state_capture(*hybrid.get_mem_recr(), state, error), error);
+        const auto t_after_capture = std::chrono::steady_clock::now();
         pic_require(state.end == begin && state.layers.size() == entry.data.layers.size(), "PIC GDN source boundary mismatch");
         for (size_t i = 0; i < state.layers.size(); ++i) {
             auto & layer = state.layers[i];
@@ -565,6 +569,7 @@ static bool pic_splice_body(ServerState & st, const kvmem_pic::segment_match & m
             layer.recurrent = kvmem_pic::compose(pic.preferred, pic.cpu, saved.transition, layer.recurrent);
             layer.conv = saved.conv_end.data;
         }
+        const auto t_after_compose = std::chrono::steady_clock::now();
         state.end = end;
         std::vector<uint8_t> carry;
         if (st.spec.ok) {
@@ -588,9 +593,23 @@ static bool pic_splice_body(ServerState & st, const kvmem_pic::segment_match & m
         request.max_plan_bytes = kvmem_pic::maximum_store_bytes;
         kvmem_pic::kv_splice_plan plan;
         pic_check(kvmem_pic::pic_kv_prepare(*raw.stash, adapter, request, plan, error), error);
+        const auto t_after_prepare = std::chrono::steady_clock::now();
         pic_check(kvmem_pic::pic_kv_validate(adapter, plan, error), error);
+        const auto t_after_validate = std::chrono::steady_clock::now();
         pic_check(adapter.pic_kv_commit(plan, error), error);
+        const auto t_after_commit = std::chrono::steady_clock::now();
         pic_check(kvmem_pic::pic_state_install(*hybrid.get_mem_recr(), state, end, error), error);
+        const auto t_after_install = std::chrono::steady_clock::now();
+        const auto ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        phase_begin = ms(started, t_after_begin);
+        phase_capture = ms(t_after_begin, t_after_capture);
+        phase_compose = ms(t_after_capture, t_after_compose);
+        phase_prepare = ms(t_after_compose, t_after_prepare);
+        phase_validate = ms(t_after_prepare, t_after_validate);
+        phase_commit = ms(t_after_validate, t_after_commit);
+        phase_install = ms(t_after_commit, t_after_install);
         if (st.spec.ok) common_speculative_set_state(st.spec.spec, 0, carry);
         pic_sync(st);
         pic_require(llama_kvmem_store_n_tokens() == (uint32_t) end && llama_kvmem_recr_pos_max() == end - 1,
@@ -616,6 +635,11 @@ static bool pic_splice_body(ServerState & st, const kvmem_pic::segment_match & m
         pic.splice_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         LOG_INF("srv    PIC hit id=%llu body=[%d,%d) mtp=%d approximate=1 query_source=bootstrap_suffix\n",
                 (unsigned long long) entry.id, begin, end, (int) st.spec.ok);
+        LOG_INF("srv    PIC splice phases begin=%.1f capture=%.1f compose=%.1f prepare=%.1f validate=%.1f commit=%.1f install=%.1f total=%.1f layers=%zu\n",
+                phase_begin, phase_capture, phase_compose, phase_prepare, phase_validate, phase_commit,
+                phase_install,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
+                state.layers.size());
         return true;
     } catch (const std::exception & e) {
         transaction.restore();
@@ -644,5 +668,3 @@ static int pic_decode_span(ServerState & st, int begin, int end, StreamIo * io, 
     st.pic->matches.clear();
     return rc;
 }
-
-#endif // Unfinished PIC server orchestration is intentionally not compiled.

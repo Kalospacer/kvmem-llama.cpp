@@ -1004,9 +1004,10 @@ diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
          }
      }
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index c4d8699..fda2294 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
-@@ -165,8 +165,10 @@
+@@ -165,8 +165,10 @@ public:
  
      std::vector<uint32_t> get_layer_ids() const;
      ggml_tensor * get_k_storage(int32_t il) const;
@@ -1017,6 +1018,15 @@ diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
  
      // state_read, plus the cells the restored tokens were placed in
      // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
+@@ -244,6 +246,8 @@ public:
+     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+ 
+ private:
++    // KVMem PIC prepares cell metadata off-line and publishes it after KV IO.
++    friend class llama_memory_kvmem;
+     const llama_model & model;
+     const llama_hparams & hparams;
+ 
 diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
 --- a/src/llama-kv-cells.h
 +++ b/src/llama-kv-cells.h

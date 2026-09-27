@@ -7,6 +7,7 @@
 #include "llama-kvmem-capture.h"
 #include "llama-kvmem-factory.h"
 #include "llama-kvmem-hooks.h"
+#include "llama-kvmem-pic-kv.h"
 #include "llama-kvmem-quant.h"
 #include "llama-kvmem-stagein.h"
 #include "llama-kvmem-transfer.h"
@@ -36,6 +37,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 
 static llama_kvmem_params g_kvmem_params = {};
 static std::atomic<bool> g_kvmem_pool_copy_cow{true};
@@ -631,6 +633,8 @@ void llama_memory_kvmem::reset_slots() {
 
 void llama_memory_kvmem::reset_policy() {
     ++attention_epoch_;
+    approximate_from_ = UINT32_MAX;
+    pic_poisoned_ = false;
     explicit_spans_ = false;
     query_frozen_ = false;
     turn_spans_ = {};
@@ -675,6 +679,7 @@ void llama_memory_kvmem::truncate_cached(uint32_t n_past) {
     if (runtime_ && n_past < runtime_->store().total_tokens()) {
         runtime_->truncate_to(n_past);
     }
+    if (n_past <= approximate_from_) approximate_from_ = UINT32_MAX;
 }
 
 void llama_memory_kvmem::set_replay(bool replay) {
@@ -1351,6 +1356,7 @@ bool llama_memory_kvmem::prepare_ubatches(
         const std::vector<llama_ubatch> & ubatches,
         uint32_t n_new_tokens,
         llama_kv_cache::slot_info_vec_t & sinfos) {
+    if (pic_poisoned_) return false;
     if (gpu_reuse_requested()) {
         // Pressure can harvest before the first ubatch hook. Finish the prior
         // batch's graphs before planning any synchronous stage-out.
@@ -1435,11 +1441,13 @@ llama_memory_context_ptr llama_memory_kvmem::init_batch(
 }
 
 llama_memory_context_ptr llama_memory_kvmem::init_full() {
+    if (pic_poisoned_) return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     note_external_kv_write();
     return kv_->init_full();
 }
 
 llama_memory_context_ptr llama_memory_kvmem::init_update(llama_context * lctx, bool optimize) {
+    if (pic_poisoned_) return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     auto update = kv_->init_update(lctx, optimize);
     if (update->get_status() != LLAMA_MEMORY_STATUS_NO_UPDATE) note_external_kv_write();
     return update;
@@ -3030,7 +3038,7 @@ llama_kvmem_attention_view llama_memory_kvmem::attention_view(bool canonical) co
     llama_kvmem_attention_view view;
     view.epoch = attention_epoch_;
     view.rows = store_n_tokens();
-    view.valid = kv_ && runtime_ && store().config().optimize_stage_in;
+    view.valid = !pic_poisoned_ && kv_ && runtime_ && store().config().optimize_stage_in;
     uint32_t resident_rows = 0;
     for (const auto & b : store().blocks()) {
         if (b.gpu_slot < 0 || !b.n_tokens) continue;
@@ -3149,6 +3157,7 @@ bool llama_memory_kvmem::commit_resident(bool canonical) {
 }
 
 bool llama_memory_kvmem::get_query(llama_kvmem_query_state & state) {
+    if (pic_poisoned_) return false;
     harvest_flush();
     bool any = false;
     uint32_t rows = 0;
@@ -3161,10 +3170,12 @@ bool llama_memory_kvmem::get_query(llama_kvmem_query_state & state) {
     if (!any) return false;
     state.sum = q_sum_;
     state.count = q_count_;
+    state.approximate = pic_approximate();
     return true;
 }
 
 bool llama_memory_kvmem::set_query(const llama_kvmem_query_state & state) {
+    if (pic_poisoned_ || state.approximate != pic_approximate()) return false;
     if (state.sum.size() != n_layer_ || state.count.size() != n_layer_) return false;
     uint32_t rows = 0;
     for (uint32_t il = 0; il < n_layer_; ++il) {
@@ -3309,6 +3320,204 @@ void llama_memory_kvmem::apply_selection(const llama_kvmem_selection & selection
     }
 }
 
+bool llama_memory_kvmem::pic_bind_epoch(uint64_t epoch, std::string & error) {
+    if (!epoch || pic_poisoned_ || (pic_epoch_ && pic_epoch_ != epoch && store_n_tokens())) {
+        error = "PIC epoch binding requires a valid generation and clean memory; changes require full clear";
+        return false;
+    }
+    if (pic_epoch_ != epoch) {
+        pool_preserve_end(false);
+        pic_epoch_ = epoch;
+        ++attention_epoch_;
+    }
+    error.clear();
+    return true;
+}
+
+bool llama_memory_kvmem::pic_kv_commit(const kvmem_pic::kv_splice_plan & plan, std::string & error) {
+    // All allocations precede the first write. GPU errors cannot be undone by
+    // truncating a partial tail, so the outer transaction owns full recovery.
+    try {
+        const int64_t pt0 = ggml_time_us();
+        const auto require = [](bool ok, const char * why) {
+            if (!ok) throw std::invalid_argument(why);
+        };
+        require(!pic_poisoned_ && !pool_preserve_, "PIC commit requires clean memory outside a preserve scope");
+        require(pic_epoch_ && plan.identity.epoch == pic_epoch_ && plan.identity.model == &model_ &&
+                plan.identity.mtp_model == (mtp_ ? &mtp_->model_ : nullptr), "PIC live model/config identity mismatch");
+        require(runtime_ && raw_ && !runtime_->config().cpu_bytes && !runtime_->config().nvme_bytes,
+                "PIC commit currently requires raw-only RAM backing");
+        require(kv_ && !kv_->other && kv_->sc_info.empty() && !kv_->get_has_shift() &&
+                (!mtp_ || (!mtp_->kv_->other && mtp_->kv_->sc_info.empty() && !mtp_->kv_->get_has_shift())),
+                "PIC commit rejects shared or pending-update KV caches");
+        decode_mean_flush();
+        decode_mean_discard();
+        harvest_flush();
+        harvest_gpu_v_commit();
+        if (mtp_) mtp_->harvest_flush();
+        const int64_t pt_flush = ggml_time_us();
+        if (!kvmem_pic::pic_kv_validate(*this, plan, error)) return false;
+        const int64_t pt_validate = ggml_time_us();
+        require(row_positions_.size() == plan.destination_begin, "PIC live row metadata does not end at append boundary");
+
+        std::vector<bool> slots_used(n_slots_, false);
+        for (const auto & b : store().blocks()) {
+            require(!b.in_flight, "PIC commit rejects in-flight runtime blocks");
+            if (b.gpu_slot < 0) continue;
+            require(uint32_t(b.gpu_slot) < n_slots_ && !slots_used[b.gpu_slot], "PIC live slot aliases another block");
+            slots_used[b.gpu_slot] = true;
+        }
+        for (int32_t slot : free_slots_) {
+            require(slot >= 0 && uint32_t(slot) < n_slots_ && !slots_used[slot], "PIC free slot table is inconsistent");
+            slots_used[slot] = true;
+        }
+        require(std::all_of(slots_used.begin(), slots_used.end(), [](bool used) { return used; }), "PIC slot table has missing slots");
+        const auto & first = plan.blocks.front();
+        for (uint32_t t = 0; t < first.prefix_rows; ++t) {
+            const uint32_t row = first.block_id * block_tokens_ + t;
+            const auto & pos = row_positions_[row];
+            require(pos.token >= 0 &&
+                    std::all_of(pos.pos.begin(), pos.pos.end(), [&](llama_pos p) { return p == pos.pos[0]; }),
+                    "PIC untouched tail prefix is not scalar text");
+            const uint32_t cell = uint32_t(first.previous_slot) * block_tokens_ + t;
+            for (const auto * cache : {kv_, mtp_ ? mtp_->get_kv() : nullptr}) {
+                if (!cache) continue;
+                const auto & cells = cache->get_cells(0);
+                require(cell < cells.size() && !cells.is_empty(cell) && cells.seq_count(cell) == 1 &&
+                        cells.seq_has(cell, 0) && cells.ext_get(cell).tok == pos.token &&
+                        cells.ext_get(cell).logical_pos == llama_pos(row) && cells.pos_get(cell) == pos.pos[0],
+                        "PIC untouched prefix cell metadata mismatch");
+            }
+        }
+
+        const int64_t pt_checks = ggml_time_us();
+        auto next_raw = raw_->clone_prefix(plan.destination_begin);
+        auto next_mtp = mtp_ ? mtp_->raw().clone_prefix(plan.destination_begin) : nullptr;
+        auto next_runtime = std::make_unique<kvmem::KvMemRuntime>(runtime_->config(), &backend_);
+        next_runtime->store() = store();
+        next_runtime->register_append(plan.destination_end - plan.destination_begin);
+        const int64_t pt_clone = ggml_time_us();
+        auto next_slots = free_slots_;
+        for (const auto & b : plan.blocks) {
+            int32_t slot = b.previous_slot;
+            if (slot < 0) {
+                require(!next_slots.empty(), "PIC slot reservation exhausted");
+                slot = next_slots.back();
+                next_slots.pop_back();
+            }
+            require(uint64_t(slot) * block_tokens_ + b.valid_rows <= kv_size_, "PIC block exceeds physical slot capacity");
+            next_runtime->store().set_block_tier(b.block_id, kvmem::KvTier::GPU, -1, -1);
+            next_runtime->store().set_block_gpu_slot(b.block_id, slot);
+            for (const auto & layer : b.layers) {
+                auto & raw = layer.codec.mtp ? *next_mtp : *next_raw;
+                const uint32_t start = b.block_id * block_tokens_;
+                raw.write_layer_k_gpu(start, b.valid_rows, layer.codec.raw_layer, layer.packed_k.data());
+                raw.write_layer_v_gpu(start, b.valid_rows, layer.codec.raw_layer, layer.packed_v.data());
+                raw.write_layer_mean_sum(start, b.valid_rows, layer.codec.raw_layer, layer.k_sum.data());
+            }
+        }
+        const int64_t pt_write = ggml_time_us();
+        auto next_positions = row_positions_;
+        next_positions.resize(plan.destination_end);
+        auto next_cells = kv_->v_cells[0];
+        llama_kv_cells next_mtp_cells;
+        if (mtp_) next_mtp_cells = mtp_->kv_->v_cells[0];
+        uint32_t next_head = 0;
+        for (size_t i = 0; i < plan.tokens.size(); ++i) {
+            const uint32_t row = plan.destination_begin + uint32_t(i);
+            auto & position = next_positions[row];
+            position.pos = plan.positions[i];
+            position.token = plan.tokens[i];
+            // Mirror prepare_ubatches: is_pos_2d() is n_pos >= 3, so an M-RoPE
+            // model marks every row, including scalar text, as spatial.
+            position.spatial = model_.hparams.n_pos_per_embd() >= 3;
+            const auto & block = next_runtime->store().blocks()[row / block_tokens_];
+            const uint32_t cell = uint32_t(block.gpu_slot) * block_tokens_ + row % block_tokens_;
+            for (auto * cells : {&next_cells, mtp_ ? &next_mtp_cells : nullptr}) {
+                if (!cells) continue;
+                require(cell < cells->size() && cells->is_empty(cell), "PIC append would overwrite a visible cell");
+                cells->pos_set(cell, position.pos[0]);
+                llama_kv_cell_ext ext;
+                ext.logical_pos = row;
+                ext.tok = position.token;
+                ext.y = position.pos[1];
+                ext.x = position.pos[2];
+                cells->ext_set(cell, ext);
+                cells->seq_add(cell, 0);
+            }
+            next_head = cell + 1;
+        }
+
+        const int64_t pt_cells = ggml_time_us();
+        // Live metadata still describes the old prefix until every transfer is
+        // complete. From this point any failure requires full transaction reset.
+        pool_preserve_end(false);
+        pic_poisoned_ = true;
+        ++attention_epoch_;
+        bool device_write = false;
+        uint64_t pic_upload_calls = 0, pic_upload_bytes = 0;
+        for (const auto & b : plan.blocks) {
+            const uint32_t cell0 = uint32_t(next_runtime->store().blocks()[b.block_id].gpu_slot) * block_tokens_;
+            for (const auto & layer : b.layers) {
+                auto * cache = layer.codec.mtp ? mtp_->get_kv() : kv_;
+                const auto upload = [&](ggml_tensor * tensor, const std::vector<uint8_t> & bytes) {
+                    const size_t offset = size_t(cell0) * tensor->nb[1];
+                    ++pic_upload_calls;
+                    pic_upload_bytes += bytes.size();
+                    if (auto * device = kvmem_cuda_tensor_ptr(tensor)) {
+                        device_write = true;
+                        if (kvmem_copy(device + offset, bytes.data(), bytes.size(), cudaMemcpyHostToDevice) != cudaSuccess)
+                            throw std::runtime_error("PIC packed KV upload failed");
+                    } else {
+                        kvmem_tensor_set(tensor, bytes.data(), offset, bytes.size());
+                    }
+                };
+                upload(cache->get_k_storage(layer.codec.graph_layer), layer.packed_k);
+                upload(cache->get_v_storage(layer.codec.graph_layer), layer.packed_v);
+            }
+        }
+        llama_kvmem_pic_report_uploads(pic_upload_calls, pic_upload_bytes);
+        const int64_t pt_upload = ggml_time_us();
+        if (device_write && cudaDeviceSynchronize() != cudaSuccess) throw std::runtime_error("PIC KV completion fence failed");
+        const int64_t pt_sync = ggml_time_us();
+        // MSVC's llama_kv_cells is nothrow move-assignable but not nothrow
+        // swappable (its embedded 256-entry set array), so publish by move.
+        static_assert(std::is_nothrow_move_assignable<llama_kv_cells>::value, "PIC metadata publication must not allocate");
+        runtime_.swap(next_runtime);
+        raw_.swap(next_raw);
+        if (mtp_) mtp_->swap_raw(next_mtp);
+        row_positions_.swap(next_positions);
+        free_slots_.swap(next_slots);
+        kv_->v_cells[0] = std::move(next_cells);
+        if (!kv_->v_heads.empty()) kv_->v_heads[0] = next_head;
+        if (mtp_) {
+            mtp_->kv_->v_cells[0] = std::move(next_mtp_cells);
+            if (!mtp_->kv_->v_heads.empty()) mtp_->kv_->v_heads[0] = next_head;
+        }
+        approximate_from_ = std::min(approximate_from_, plan.destination_begin);
+        reset_query_acc();
+        query_frozen_ = false;
+        pic_poisoned_ = false;
+        const int64_t pt_publish = ggml_time_us();
+        next_runtime.reset();
+        next_raw.reset();
+        next_mtp.reset();
+        const int64_t pt_free = ggml_time_us();
+        kvmem_diag("KVMEM_PIC_COMMIT flush=%.1f validate=%.1f checks=%.1f clone=%.1f write=%.1f cells=%.1f "
+                "upload=%.1f sync=%.1f publish=%.1f free=%.1f uploads=%llu upload_kb=%.1f blocks=%zu rows=%u\n",
+                (pt_flush - pt0) / 1e3, (pt_validate - pt_flush) / 1e3, (pt_checks - pt_validate) / 1e3,
+                (pt_clone - pt_checks) / 1e3, (pt_write - pt_clone) / 1e3, (pt_cells - pt_write) / 1e3,
+                (pt_upload - pt_cells) / 1e3, (pt_sync - pt_upload) / 1e3, (pt_publish - pt_sync) / 1e3,
+                (pt_free - pt_publish) / 1e3, (unsigned long long) pic_upload_calls, pic_upload_bytes / 1024.0,
+                plan.blocks.size(), plan.destination_begin);
+        error.clear();
+        return true;
+    } catch (const std::exception & e) {
+        error = e.what();
+        return false;
+    }
+}
+
 bool llama_kvmem_stash::truncate_to(uint32_t prefix_rows) {
     if (!runtime || !raw || prefix_rows == 0 || prefix_rows > rows ||
             runtime->store().total_tokens() < prefix_rows || row_positions.size() < prefix_rows) {
@@ -3327,6 +3536,7 @@ bool llama_kvmem_stash::truncate_to(uint32_t prefix_rows) {
     resident.erase(std::remove_if(resident.begin(), resident.end(),
             [n_blocks](uint32_t id) { return id >= n_blocks; }), resident.end());
     rows = prefix_rows;
+    if (rows <= approximate_from) approximate_from = UINT32_MAX;
     return true;
 }
 
@@ -3366,6 +3576,7 @@ void llama_memory_kvmem::append_allocations(std::vector<std::pair<const void *, 
 }
 
 bool llama_memory_kvmem::gpu_reuse_supported() const {
+    if (pic_poisoned_ || pic_approximate()) return false;
     if (!g_kvmem_pool_gpu_reuse.load(std::memory_order_relaxed) || !runtime_ || !raw_ || !kv_ ||
             v_trans_ || raw_->nvme_enabled() || runtime_->config().cpu_bytes || runtime_->config().nvme_bytes) return false;
     for (uint32_t il : kv_->get_layer_ids()) {
@@ -3496,6 +3707,7 @@ bool llama_memory_kvmem::restage_resident_tags(const std::vector<uint32_t> & res
 }
 
 std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_rows) {
+    if (pic_poisoned_) return nullptr;
     if (!runtime_ || !raw_ || !kv_ || v_trans_ || replay_ || raw_->nvme_enabled()) return nullptr;
     if (mtp_ && !mtp_->can_stash()) return nullptr;
     auto & store = runtime_->store();
@@ -3540,6 +3752,7 @@ std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_r
 
     auto stash = std::make_unique<llama_kvmem_stash>();
     stash->rows = rows;
+    stash->approximate_from = approximate_from_;
     // Allocate every replacement before moving any target state. MTP take
     // likewise allocates first; after it succeeds the swaps cannot throw.
     stash->runtime = std::make_unique<kvmem::KvMemRuntime>(runtime_->config(), &backend_);
@@ -3661,11 +3874,13 @@ bool llama_memory_kvmem::stash_put_prefix(std::unique_ptr<llama_kvmem_stash> sta
     raw_.swap(stash->raw);
     row_positions_.swap(stash->row_positions);
     if (mtp_) mtp_->swap_raw(stash->mtp_raw);
+    std::swap(approximate_from_, stash->approximate_from);
     const auto rollback = [&]() {
         runtime_.swap(stash->runtime);
         raw_.swap(stash->raw);
         row_positions_.swap(stash->row_positions);
         if (mtp_) mtp_->swap_raw(stash->mtp_raw);
+        std::swap(approximate_from_, stash->approximate_from);
         stash_reset_empty();
     };
     try {
@@ -3685,6 +3900,7 @@ bool llama_memory_kvmem::stash_fork(const llama_kvmem_stash & stash, uint32_t ro
     if (rows == 0 || stash.row_positions.size() < rows) return false;
     auto copy = std::make_unique<llama_kvmem_stash>();
     copy->rows = rows;
+    copy->approximate_from = stash.approximate_from;
     const bool cow = g_kvmem_pool_copy_cow.load(std::memory_order_relaxed);
     copy->raw = cow ? stash.raw->clone_prefix(rows) : stash.raw->clone_prefix_deep(rows);
     if (mtp_) copy->mtp_raw = cow ? stash.mtp_raw->clone_prefix(rows) : stash.mtp_raw->clone_prefix_deep(rows);
@@ -4273,6 +4489,39 @@ size_t llama_kvmem_stash_bytes(const llama_kvmem_stash * stash) {
 
 void llama_kvmem_stash_free(llama_kvmem_stash * stash) {
     delete stash;
+}
+
+bool llama_kvmem_stash_is_approximate(const llama_kvmem_stash * stash) {
+    return stash && stash->approximate_from != UINT32_MAX;
+}
+
+static uint64_t g_pic_upload_calls = 0, g_pic_upload_bytes = 0;
+
+void llama_kvmem_pic_report_uploads(uint64_t calls, uint64_t bytes) {
+    g_pic_upload_calls = calls;
+    g_pic_upload_bytes = bytes;
+}
+
+bool llama_kvmem_pic_is_approximate() {
+    auto * mem = kvmem_capture_active();
+    return mem && mem->pic_approximate();
+}
+
+bool llama_kvmem_pic_is_poisoned() {
+    auto * mem = kvmem_capture_active();
+    return mem && mem->pic_poisoned();
+}
+
+bool llama_kvmem_pic_bind_epoch(uint64_t epoch, std::string & error) {
+    auto * mem = kvmem_capture_active();
+    if (!mem) { error = "PIC requires an active KVMem memory"; return false; }
+    return mem->pic_bind_epoch(epoch, error);
+}
+
+bool llama_kvmem_pic_kv_commit(const kvmem_pic::kv_splice_plan & plan, std::string & error) {
+    auto * mem = kvmem_capture_active();
+    if (!mem) { error = "PIC requires an active KVMem memory"; return false; }
+    return mem->pic_kv_commit(plan, error);
 }
 
 void llama_kvmem_set_pool_copy(bool cow) {

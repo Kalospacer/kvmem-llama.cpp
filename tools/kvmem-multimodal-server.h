@@ -339,6 +339,11 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
     return 0;
 }
 
+// ---- Server-side transparent PIC -------------------------------------------
+// Enabled only with --kvmem-pic on. Inserted here because it uses
+// multimodal_checkpoint/restore/decode_span and must precede pool accounting.
+#include "kvmem-pic-server.h"
+
 // ---- Conversation pool ------------------------------------------------------
 // The slot holds one live conversation. Others are parked as host-side stashes
 // with their recurrent checkpoints; a request that continues a parked
@@ -837,6 +842,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
             kvmem_diag("KVMEM_TRACE multimodal_reset context=%p reason=explicit_cache_reset\n", (void *) st.ctx);
             multimodal_invalidate_queries(st);
             memory_clear_all(st);
+            pic_reset(st);
             st.mm_reset_requested = false;
         }
         st.mm_new_text = st.mm_new_image = st.mm_replayed = st.mm_tail_replayed = 0;
@@ -987,7 +993,9 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
         }
         if (n_cache_hit) *n_cache_hit = base.row;
         const auto checkpoint_rows = multimodal_plan_checkpoints(st, prompt, base.row, query);
-        if (multimodal_decode_span(st, base.row, query, false, io, &checkpoint_rows) != 0) throw std::runtime_error("multimodal prefill failed or cancelled");
+        pic_request_spans(st, query, eval_end, st.kparams.force_pos, spans);
+        pic_plan_request(st, prompt, base.row, eval_end, io);
+        if (pic_decode_span(st, base.row, query, io, &checkpoint_rows) != 0) throw std::runtime_error("multimodal prefill failed or cancelled");
         auto query_checkpoint = multimodal_checkpoint(st, query);
         multimodal_remember(st, query_checkpoint);
         const auto probe_view = llama_kvmem_get_attention_view();

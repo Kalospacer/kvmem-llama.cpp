@@ -40,6 +40,19 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
      if (mctx && !mctx->apply()) {
          LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
          ret = GGML_STATUS_FAILED;
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 5850e09..fda2294 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -246,6 +246,8 @@ public:
+     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+ 
+ private:
++    // KVMem PIC prepares cell metadata off-line and publishes it after KV IO.
++    friend class llama_memory_kvmem;
+     const llama_model & model;
+     const llama_hparams & hparams;
+ 
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp

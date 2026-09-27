@@ -3,6 +3,8 @@
 #include "llama-memory-kvmem.h"
 #include "llama-memory-kvmem-mtp.h"
 #include "llama-kvmem-quant.h"
+#include "llama-kvmem-diag.h"
+#include "ggml.h"
 
 #include <algorithm>
 #include <cmath>
@@ -170,7 +172,7 @@ std::vector<float> content_rows(const kv_layer_codec & codec, const std::vector<
                 "PIC mean dequantization failed");
     }
     if (codec.k.hadamard_nrot) {
-        kvmem_hadamard_rows(result.data(), positions.size(), codec.k.heads, codec.k.head_dim, codec.k.hadamard_nrot);
+        hadamard_rows_fast(result.data(), positions.size(), codec.k.heads, codec.k.head_dim, codec.k.hadamard_nrot);
     }
     require(std::all_of(result.begin(), result.end(), [](float x) { return std::isfinite(x); }),
             "non-finite reconstructed PIC mean rows");
@@ -216,6 +218,8 @@ size_t kv_splice_plan::bytes() const {
 
 bool pic_kv_prepare(const llama_kvmem_stash & source, llama_memory_kvmem & dst,
                     const kv_splice_request & request, kv_splice_plan & out, std::string & error) {
+    const int64_t pt0 = ggml_time_us();
+    int64_t us_read = 0, us_reloc = 0, us_mean = 0;
     try {
         require(request.source_identity.model && request.source_identity.epoch &&
                 request.source_identity.independently_evaluated &&
@@ -242,11 +246,21 @@ bool pic_kv_prepare(const llama_kvmem_stash & source, llama_memory_kvmem & dst,
         }
         for (size_t i = 0; i < request.tokens.size(); ++i) {
             const auto & src = source.row_positions[request.source_begin + i];
-            require(!src.spatial && src.token >= 0 && src.token == request.tokens[i], "PIC source token/body mismatch or media row");
+            // row.spatial mirrors is_pos_2d() (n_pos >= 3) and is set for every
+            // row of an M-RoPE model, including scalar text. The real constraint
+            // is nonnegative tokens and four equal text position axes.
+            if (src.token < 0 || src.token != request.tokens[i]) {
+                char detail[192];
+                snprintf(detail, sizeof(detail),
+                        "PIC src token mismatch i=%zu spatial=%d src=%d want=%d pos=%d",
+                        i, (int) src.spatial, (int) src.token, (int) request.tokens[i], (int) src.pos[0]);
+                require(false, detail);
+            }
             text_position(src.pos);
             text_position(request.positions[i]);
         }
 
+        const int64_t pt_checks = ggml_time_us();
         kv_splice_plan plan;
         plan.destination = &dst;
         plan.identity = request.destination_identity;
@@ -295,13 +309,18 @@ bool pic_kv_prepare(const llama_kvmem_stash & source, llama_memory_kvmem & dst,
                 layer.codec = codec;
                 const auto & src_raw = codec.mtp ? *source.mtp_raw : *source.raw;
                 const auto & dst_raw = live_raw(dst, codec.mtp);
+                int64_t lt = ggml_time_us();
                 auto source_k = read_rows(src_raw, codec.raw_layer, request.source_begin + body_off, take, true);
                 auto source_v = read_rows(src_raw, codec.raw_layer, request.source_begin + body_off, take, false);
+                us_read += ggml_time_us() - lt;
+                lt = ggml_time_us();
                 std::vector<uint8_t> moved_k;
                 std::string reason;
                 const auto status = relocate_packed_k(codec.k, source_pos, destination_pos,
                         source_k.data(), source_k.size(), moved_k, reason);
                 require(status == rope_status::ok, reason.c_str());
+                us_reloc += ggml_time_us() - lt;
+                lt = ggml_time_us();
                 layer.k_sum.assign(k_elements(codec), 0.0f);
                 if (block.prefix_rows) {
                     layer.packed_k = read_rows(dst_raw, codec.raw_layer, block_start, block.prefix_rows, true);
@@ -333,6 +352,7 @@ bool pic_kv_prepare(const llama_kvmem_stash & source, llama_memory_kvmem & dst,
                     }
                 }
                 add_rows(layer.k_sum, content_rows(codec, source_k, source_pos), take);
+                us_mean += ggml_time_us() - lt;
                 layer.packed_k.insert(layer.packed_k.end(), moved_k.begin(), moved_k.end());
                 layer.packed_v.insert(layer.packed_v.end(), source_v.begin(), source_v.end());
                 block.layers.push_back(std::move(layer));
@@ -340,7 +360,11 @@ bool pic_kv_prepare(const llama_kvmem_stash & source, llama_memory_kvmem & dst,
             plan.blocks.push_back(std::move(block));
         }
         require(plan.bytes() <= request.max_plan_bytes, "PIC retained capacity exceeds plan budget");
+        const int64_t pt_blocks = ggml_time_us();
         const bool valid = pic_kv_validate(dst, plan, error);
+        kvmem_diag("KVMEM_PIC_PREPARE checks=%.1f blocks=%.1f read=%.1f reloc=%.1f mean=%.1f validate=%.1f n_blocks=%zu layers=%zu tokens=%zu\n",
+                (pt_checks - pt0) / 1e3, (pt_blocks - pt_checks) / 1e3, us_read / 1e3, us_reloc / 1e3, us_mean / 1e3,
+                (ggml_time_us() - pt_blocks) / 1e3, plan.blocks.size(), request.destination_codecs.size(), request.tokens.size());
         require(valid, error.c_str());
         out = std::move(plan);
         error.clear();

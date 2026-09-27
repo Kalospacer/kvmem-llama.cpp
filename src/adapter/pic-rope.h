@@ -46,6 +46,12 @@ enum class rope_status { ok, unsupported, invalid_input };
 // Same-position rows preserve packed bytes. Moved rows incur requantization loss.
 // On rejection, output stays unchanged and reason identifies the exact cause.
 // Allocation exceptions propagate with output unchanged. Aliasing output is OK.
+// Normalized Walsh-Hadamard transform over every nrot-wide chunk of each
+// token row [heads*head_dim]; same matrix as kvmem_hadamard_rows (H^2 = I) but
+// an O(n log n) butterfly. Rounding differs from the dense reference only at
+// F32 epsilon, which the approximate PIC path tolerates. nrot must be 2^k.
+void hadamard_rows_fast(float * rows, size_t n_rows, int heads, int head_dim, int nrot);
+
 rope_status relocate_packed_k(const packed_k_rope_config & cfg,
                               const std::vector<rope_position> & source_positions,
                               const std::vector<rope_position> & destination_positions,

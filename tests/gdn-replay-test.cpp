@@ -463,8 +463,24 @@ static void check_pic_rope_case(ggml_backend_t cpu, ggml_type type, int mode, in
                 ggml_type_name(type), mode, d, n_rot, hadamard, max_error);
 }
 
+static void check_pic_fast_hadamard() {
+    for (int nrot : {64, 128, 256}) {
+        const int heads = 4, head_dim = 256, rows = 3;
+        std::vector<float> dense(size_t(rows) * heads * head_dim);
+        for (size_t i = 0; i < dense.size(); ++i) dense[i] = std::sin(0.37f * float(i) + 0.11f) * 3.0f;
+        auto fast = dense;
+        kvmem_hadamard_rows(dense.data(), rows, heads, head_dim, nrot);
+        kvmem_pic::hadamard_rows_fast(fast.data(), rows, heads, head_dim, nrot);
+        float max_error = 0.0f;
+        for (size_t i = 0; i < dense.size(); ++i) max_error = std::max(max_error, std::fabs(dense[i] - fast[i]));
+        require(max_error < 1e-4f, "fast PIC Hadamard differs from dense reference");
+        std::printf("PASS PIC fast Hadamard vs dense: nrot=%d max_error=%.9g\n", nrot, max_error);
+    }
+}
+
 static void check_pic_rope(ggml_backend_t cpu) {
     using namespace kvmem_pic;
+    check_pic_fast_hadamard();
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
         for (int mode : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE})
             check_pic_rope_case(cpu, type, mode, 128, 64, type == GGML_TYPE_Q8_0 ? 128 : 0);

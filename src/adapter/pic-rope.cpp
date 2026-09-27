@@ -35,6 +35,29 @@ void rotate_row(float * row, const packed_k_rope_config & cfg, int32_t position,
 
 } // namespace
 
+void hadamard_rows_fast(float * rows, size_t n_rows, int heads, int head_dim, int nrot) {
+    if (!rows || n_rows == 0 || heads <= 0 || nrot <= 1 || head_dim < nrot || head_dim % nrot != 0) return;
+    if ((nrot & (nrot - 1)) != 0) {
+        kvmem_hadamard_rows(rows, int64_t(n_rows), heads, head_dim, nrot);
+        return;
+    }
+    const float scale = 1.0f / std::sqrt(float(nrot));
+    const size_t total = n_rows * size_t(heads) * size_t(head_dim);
+    for (size_t off = 0; off < total; off += size_t(nrot)) {
+        float * x = rows + off;
+        for (int len = 1; len < nrot; len <<= 1) {
+            for (int i = 0; i < nrot; i += len << 1) {
+                for (int j = i; j < i + len; ++j) {
+                    const float a = x[j], b = x[j + len];
+                    x[j] = a + b;
+                    x[j + len] = a - b;
+                }
+            }
+        }
+        for (int i = 0; i < nrot; ++i) x[i] *= scale;
+    }
+}
+
 rope_status relocate_packed_k(const packed_k_rope_config & cfg,
                               const std::vector<rope_position> & source_positions,
                               const std::vector<rope_position> & destination_positions,
@@ -121,10 +144,10 @@ rope_status relocate_packed_k(const packed_k_rope_config & cfg,
             std::memcpy(result.data() + offset, bytes + offset, row_bytes);
             continue;
         }
-        if (cfg.hadamard_nrot) kvmem_hadamard_rows(row.data(), 1, cfg.heads, cfg.head_dim, cfg.hadamard_nrot);
+        if (cfg.hadamard_nrot) hadamard_rows_fast(row.data(), 1, cfg.heads, cfg.head_dim, cfg.hadamard_nrot);
         rotate_row(row.data(), cfg, source_positions[token][0], true);
         rotate_row(row.data(), cfg, destination_positions[token][0], false);
-        if (cfg.hadamard_nrot) kvmem_hadamard_rows(row.data(), 1, cfg.heads, cfg.head_dim, cfg.hadamard_nrot);
+        if (cfg.hadamard_nrot) hadamard_rows_fast(row.data(), 1, cfg.heads, cfg.head_dim, cfg.hadamard_nrot);
         if (!finite(row)) return reject(rope_status::invalid_input, "packed K transform overflowed");
         traits->from_float_ref(row.data(), aligned.data(), row_elements);
         // Finite F32 values may overflow F16 (or a Q8_0 block's F16 scale).

@@ -30,14 +30,31 @@ Relevant options:
 
 GPU reuse defaults to off. It was explicitly enabled in the validated deployment.
 
-## PIC remains incomplete
+## PIC: functional, off by default, not beneficial yet
 
-The branch contains independently testable GDN transition/composition, capture,
-state, packed RoPE relocation, KV preparation and segment-store components.
-`tools/kvmem-pic-server.h` is an excluded integration draft. Adapter commit,
-complete transaction/MTP integration and end-to-end quality validation remain
-unfinished. `--kvmem-pic on` fails explicitly; off is the default. These components
-must not be described as a functioning position-independent cache.
+`--kvmem-pic on` now runs end to end: the adapter implements `pic_kv_commit`,
+the server routes message-local 512-token segments through a live transaction,
+and MTP state is carried across the splice. Off remains the default and the
+validated deployment keeps it off. PIC is approximate; outputs are not
+guaranteed to match exact prefill.
+
+- M-RoPE models mark every row `spatial` (`n_pos >= 3`), including scalar text.
+  Preparation now checks tokens and equal position axes instead of the flag.
+- PIC relocation uses `kvmem_pic::hadamard_rows_fast` (butterfly WHT) instead of
+  the dense O(n^2) `kvmem_hadamard_rows`. This cut splice preparation from
+  14.6 s to 1.05 s for a 496-token body. Exact cache paths still use the
+  original function.
+- Per-step timings: `KVMEM_PIC_PREPARE` and `KVMEM_PIC_COMMIT` under KVMEM_TRACE.
+
+Measured on V100 with the synthetic suite (9/9 checks passing, 3 cases per
+quality category matching the exact baseline): a request that hits a segment
+takes 7.3 s against 6.4 s with PIC off, and a multi-message request that builds
+a segment takes 25.7 s against 11.6 s. With 512-token segments one hit can
+save at most about 0.6 s of recompute, while the splice has more than 2 s of
+fixed cost (GDN compose alone is 1.5 s) and each segment stores about 300 MB of
+GDN transitions. Building runs synchronously inside the request (192
+independent scans). Becoming beneficial needs message-level segments, building
+off the request path, and batched GPU-resident compose/scan.
 
 ## Validation
 
@@ -48,7 +65,7 @@ That identifies the recorded deployment artifact, not a promise of reproducible
 binary hashes across build environments or Git metadata.
 
 - Host raw/COW and resident-tag tests passed, including a 507+6 ubatch-tail case.
-- PIC store and GDN/RoPE CPU numerical tests passed.
+- PIC store and GDN/RoPE CPU numerical tests passed, including fast vs dense Hadamard.
 - Eight synthetic GPU checks passed: interleaved conversation routing, actual
   branch retention, output equality against the uninterrupted branch, and GPU
   reuse counters. The sequence recorded 84 reused blocks and 399 MiB of skipped
