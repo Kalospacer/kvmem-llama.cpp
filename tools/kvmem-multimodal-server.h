@@ -358,12 +358,15 @@ static int pool_resume_row(const kvmem_prompt & prompt, int cap, const kvmem_pro
     if (!cached || cached->has_media()) return -1;
     const int lcp = (int) prompt.common_prefix(*cached);
     if (lcp_out) *lcp_out = lcp;
-    const int keep = std::min({lcp, rows, cap});
-    int best = -1;
+    // The resume rule lives in kvmem-pool-policy.h, so the tested rule and the
+    // shipped rule cannot drift; only the media-aware prefix stays here.
+    std::vector<int> rows_with_data;
+    rows_with_data.reserve(checkpoints.size());
     for (const auto & checkpoint : checkpoints) {
-        if (checkpoint.data && checkpoint.row > 0 && checkpoint.row <= keep && checkpoint.row > best) best = checkpoint.row;
+        if (checkpoint.data) rows_with_data.push_back(checkpoint.row);
     }
-    return best;
+    int keep = -1;
+    return pool_checkpoint_row(rows_with_data, lcp, rows, cap, keep) ? keep : -1;
 }
 
 static pool_policy_limits pool_limits(const ServerState & st) {
