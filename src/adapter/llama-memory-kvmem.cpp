@@ -3597,6 +3597,7 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
                 return;
             }
         }
+        ++harvest_sync_jobs_;
         std::vector<uint8_t> packed(nbytes);
         kvmem_tensor_get(t, packed.data(), toff, nbytes);
         if (is_k) {
@@ -4908,7 +4909,13 @@ std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_r
     const int64_t st_mean = ggml_time_us();
     harvest_flush();
     harvest_gpu_v_commit();
+    // Land any queued stage-in first, as detach_conv() does. The stage-out
+    // slab refuses jobs while stage-in items are pending, so after a sparse
+    // decode every harvest job below fell back to one synchronous copy:
+    // 16.9 s for a 51K-row conversation instead of well under a second.
+    kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
     const int64_t st_flush = ggml_time_us();
+    const uint64_t sync_jobs0 = harvest_sync_jobs_;
     std::vector<uint32_t> resident;
     for (const auto & b : store.blocks()) {
         if (b.gpu_slot < 0 || b.n_tokens == 0) continue;
@@ -4978,11 +4985,11 @@ std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_r
     const int64_t st_trunc = ggml_time_us();
     stash_reset_empty(pool_preserve_);
     kvmem_diag("KVMEM_STASH_TAKE mean=%.1f flush=%.1f harvest_v=%.1f mtp=%.1f check=%.1f alloc=%.1f tags=%.1f "
-            "move=%.1f truncate=%.1f reset=%.1f resident=%zu rows=%u blocks=%u\n",
+            "move=%.1f truncate=%.1f reset=%.1f resident=%zu rows=%u blocks=%u sync_jobs=%llu\n",
             (st_mean - st0) / 1e3, (st_flush - st_mean) / 1e3, (st_harvest - st_flush) / 1e3, (st_mtp - st_harvest) / 1e3,
             (st_check - st_mtp) / 1e3, (st_alloc - st_check) / 1e3, (st_tags - st_alloc) / 1e3, (st_move - st_tags) / 1e3,
             (st_trunc - st_move) / 1e3, (ggml_time_us() - st_trunc) / 1e3, stash->resident.size(), rows,
-            stash->runtime->store().block_count());
+            stash->runtime->store().block_count(), (unsigned long long) (harvest_sync_jobs_ - sync_jobs0));
     return stash;
 }
 

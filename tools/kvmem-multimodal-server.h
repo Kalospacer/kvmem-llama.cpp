@@ -746,6 +746,7 @@ static PoolEntry * pool_stash_live(ServerState & st, const char * reason) {
     }
     kept = std::move(thinned);
     e->checkpoints = std::move(kept);
+    e->turn_start = turn_start;
     e->bytes = llama_kvmem_stash_bytes(e->stash);
     e->created = e->last_used = std::chrono::steady_clock::now();
     const auto t_clear = std::chrono::steady_clock::now();
@@ -861,7 +862,10 @@ static void multimodal_pool_route(ServerState & st, const kvmem_prompt & prompt,
             auto & c = candidates[i];
             c.row = pool_resume_row(prompt, cap, st.pool[i]->prompt.get(), st.pool[i]->rows, st.pool[i]->checkpoints, &c.lcp);
             c.rows = st.pool[i]->rows;
+            c.turn_start = st.pool[i]->turn_start;
             // Fork instead of consuming the entry when it continues far past the prefix.
+            // pool_entry_forks() also forks when the request branches off before the
+            // entry's latest turn.
             c.valuable = c.row >= 0 &&
                 pool_branch_worth(st, *st.pool[i]->prompt, st.pool[i]->rows, st.pool[i]->checkpoints, c.lcp, false);
         }

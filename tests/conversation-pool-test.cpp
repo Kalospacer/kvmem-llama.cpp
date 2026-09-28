@@ -300,6 +300,42 @@ static void test_route_fork_when_the_entry_outlives_the_prefix() {
     CHECK(std::string(plan.reason) == "switch");
 }
 
+// Incident 3, with the rows of the 2026-09-28 A/B run: conversation A was
+// parked at 17458 rows with its latest turn opening at 17190; conversation
+// charlie shared only A's 15190-row system prompt.
+static void test_incident_shared_system_forks() {
+    const pool_policy_limits limits;
+    pool_live live;
+    live.rows = 18007; // B, live, unrelated to both
+    live.lcp = 6;
+    live.row = -1;
+    live.valuable = true;
+
+    pool_entry a;
+    a.rows = 17458;
+    a.lcp = 15190;
+    a.row = 12288;
+    a.valuable = false; // no message-start checkpoint past the prefix
+    a.turn_start = 17190;
+    CHECK(!a.valuable); // the old rule consumed A here
+    const auto plan = pool_route(live, {a}, limits);
+    CHECK(plan.action == pool_action::switch_in);
+    CHECK(plan.fork);
+
+    // A's own next turn with a rewritten tail diverges inside the latest turn.
+    a.lcp = 17193;
+    a.row = 17190;
+    live.valuable = false;
+    live.rows = 100;
+    CHECK(!pool_route(live, {a}, limits).fork);
+
+    // Without a recorded turn start the old behaviour is unchanged.
+    a.lcp = 15190;
+    a.row = 12288;
+    a.turn_start = -1;
+    CHECK(!pool_route(live, {a}, limits).fork);
+}
+
 static void test_route_picks_the_best_entry() {
     const pool_policy_limits limits;
     pool_live live;
@@ -326,6 +362,7 @@ int main() {
     test_route_switches_when_worthwhile();
     test_route_parks_an_abandoned_branch();
     test_route_fork_when_the_entry_outlives_the_prefix();
+    test_incident_shared_system_forks();
     test_route_picks_the_best_entry();
     if (failures) {
         std::printf("FAILED: %d check(s)\n", failures);

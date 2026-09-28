@@ -22,6 +22,12 @@
 //      oldest-first left every survivor in the rewritten tail, so a rewrite of
 //      older context could only resume near the start (68,796 rows recomputed,
 //      141 s). The spread lives in pool_keep_checkpoints below.
+//   3. A new conversation that shares only another parked conversation's
+//      system prompt consumed that entry instead of forking it: the entry's
+//      tail held no message-start checkpoint, so it looked like a rewritten
+//      tail. The owner's next turn then resumed at the system prompt (7.4 s
+//      instead of 3.9 s in the 2026-09-28 A/B run). pool_entry::turn_start
+//      is that fix.
 //
 // A check that only holds for one conversation shape is not a check. These
 // cases run without a model, a GPU, or a server.
@@ -45,7 +51,17 @@ struct pool_entry {
     int  row        = -1;  // largest checkpoint row at or before the resume cap
     int  rows       = 0;   // stored rows
     bool valuable   = false;
+    int  turn_start = -1;  // row opening the entry's latest turn, -1 if unknown
 };
+
+// A request whose shared prefix ends before the entry's latest turn is another
+// branch of that conversation, not its next turn: consuming the entry would
+// throw away the owner's history. The owner's own next turn diverges inside the
+// latest turn at the earliest (a rewritten per-turn tail starts after the turn
+// header), so it still consumes the entry and leaves no stale copy behind.
+inline bool pool_entry_forks(const pool_entry & entry) {
+    return entry.valuable || (entry.turn_start > 0 && entry.lcp < entry.turn_start);
+}
 
 // The request is a continuation of the live sequence: it extends it and drops a
 // bounded tail, so nothing is abandoned. The bound is absolute, not
@@ -190,7 +206,7 @@ inline pool_plan pool_route(const pool_live & live,
         // Fork when the entry continues well past the shared prefix and the
         // live branch must survive: the caller then shares the prefix instead
         // of consuming the entry.
-        plan.fork = entries[best].valuable;
+        plan.fork = pool_entry_forks(entries[best]);
         plan.reason = live.valuable ? "switch" : "switch_clear";
         return plan;
     }

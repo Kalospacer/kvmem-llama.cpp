@@ -344,6 +344,7 @@ struct PoolEntry {
     std::shared_ptr<const MultimodalQuery> query;
     uint64_t generation = 0;
     int rows = 0;
+    int turn_start = -1; // row opening the latest turn when parked
     // Legacy logical stash payload only, never used for the unique budget.
     size_t bytes = 0;
     std::chrono::steady_clock::time_point created, last_used;

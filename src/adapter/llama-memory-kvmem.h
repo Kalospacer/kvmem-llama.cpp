@@ -331,6 +331,8 @@ private:
     HarvestVBatch harvest_v_pending_;
     // 1 while a block's packed D2H is queued or in flight (until commit).
     std::vector<uint8_t> harvest_gpu_queued_;
+    // Harvest jobs that missed the async stage-out slab and copied synchronously.
+    uint64_t harvest_sync_jobs_ = 0;
     void copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_slot,
                                 void * host, uint64_t bytes);
     void copy_gpu_block_from_host(uint32_t block_id, int32_t gpu_slot,
