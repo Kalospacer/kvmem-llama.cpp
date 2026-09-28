@@ -152,3 +152,22 @@ specific to the captured process/thread creation identities.
 AI assistance was used to implement and review this change. Production chat
 content, credentials, private deployment logs and binary artifacts are not part
 of this branch.
+
+## State of this branch
+
+`master` is upstream master plus the fork's cache revision, and it builds and
+passes the host tests on Windows (NVMe off, sm_70):
+
+- `kvmem_store_test`, `pinned_kv_tier_test`, `resident_tags_test` (COW, MTP,
+  epochs, owner budget)
+- `kvmem-conversation-store-test` (upstream policy, 77,440 combinations)
+- `kvmem-conversation-pool-test` (pool policy, both incidents)
+
+`kvmem-session-snapshot-test` and `kvmem-session-transfer-test` crash with
+0xC0000409 on Windows **on upstream alone**, verified against a pristine
+upstream build, so they are not a regression from this merge. They are
+POSIX-only in the upstream CMake and are not built by the Windows test list.
+
+The Pool and PIC sections above describe the fork's features. PIC remains off
+by default and is not beneficial at its current 512-token segment size; the
+pool is on by default and is what the deployment uses.
