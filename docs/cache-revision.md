@@ -100,6 +100,26 @@ The multi-store branch rule (`rows - lcp <= last_n_gen + 64`) classifies every
 rewritten-tail turn as a new conversation and recomputes it in full, and it
 cannot share a system prompt across stores.
 
+The same run showed two places where the multi-store cache was faster, both of
+which were the pool's own defects and are now fixed:
+
+| Case | Pool, before | Multi-store | Pool, after |
+|---|---|---|---|
+| A short request displaces a 51K-row conversation | 18 s | 1.6 s | 1.4 s |
+| Two new conversations share another's system prompt | 7.4 s | 3.9 s | 3.7 s |
+
+The first was `harvest_full_blocks_async()` returning early under
+`--pool-gpu-reuse`, which left every resident block to be copied to the host
+when the conversation was parked: 17 s in one run and 48 s in the next, against
+0.1 s for the multi-store detach that harvests during prefill. Reuse mode now
+harvests blocks that end before the ubatch that just completed, which earlier
+ubatches wrote in full. The second was the fork rule ignoring the row that opens
+a parked entry's latest turn, so an unrelated conversation that shared only its
+system prompt consumed the entry; `pool_entry::turn_start` fixes that.
+
+With both fixed, the pool beats the multi-store cache on every case in the run,
+totalling 272 s against 474 s.
+
 Its flags still parse, so existing launch scripts start:
 
 - `--kvmem-conversations N`: `N > 1` enables the pool with
