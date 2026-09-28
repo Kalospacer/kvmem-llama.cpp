@@ -119,10 +119,46 @@ llama_memory_context_ptr llama_memory_kvmem_hybrid::init_batch(
 }
 
 void llama_memory_kvmem_hybrid::clear(bool data) {
-    llama_memory_hybrid::clear(data);
     if (attn_kvmem_) {
-        attn_kvmem_->reset_policy();
+        // The attention adapter handles an explicit preserve transaction;
+        // recurrent state still receives the ordinary clear semantics.
+        attn_kvmem_->clear(data);
+        get_mem_recr()->clear(data);
+    } else {
+        llama_memory_hybrid::clear(data);
     }
+}
+
+llama_memory_context_ptr llama_memory_kvmem_hybrid::init_full() {
+    attn_kvmem_->note_external_kv_write();
+    return llama_memory_hybrid::init_full();
+}
+
+llama_memory_context_ptr llama_memory_kvmem_hybrid::init_update(llama_context * lctx, bool optimize) {
+    auto update = llama_memory_hybrid::init_update(lctx, optimize);
+    const auto * hybrid = static_cast<const llama_memory_hybrid_context *>(update.get());
+    if (hybrid->get_attn()->get_status() != LLAMA_MEMORY_STATUS_NO_UPDATE) attn_kvmem_->note_external_kv_write();
+    return update;
+}
+
+void llama_memory_kvmem_hybrid::seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) {
+    attn_kvmem_->note_external_kv_write();
+    llama_memory_hybrid::seq_cp(src, dst, p0, p1);
+}
+
+void llama_memory_kvmem_hybrid::seq_add(llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos shift) {
+    attn_kvmem_->note_external_kv_write();
+    llama_memory_hybrid::seq_add(seq, p0, p1, shift);
+}
+
+void llama_memory_kvmem_hybrid::seq_div(llama_seq_id seq, llama_pos p0, llama_pos p1, int d) {
+    attn_kvmem_->note_external_kv_write();
+    llama_memory_hybrid::seq_div(seq, p0, p1, d);
+}
+
+void llama_memory_kvmem_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq, llama_state_seq_flags flags) {
+    if (!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) attn_kvmem_->note_external_kv_write();
+    llama_memory_hybrid::state_read(io, seq, flags);
 }
 
 bool llama_memory_kvmem_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

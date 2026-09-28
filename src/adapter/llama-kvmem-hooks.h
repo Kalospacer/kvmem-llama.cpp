@@ -53,6 +53,9 @@ LLAMA_API void llama_kvmem_register_capture(struct ggml_tensor * t, int il, char
 // Trunk and MTP must not clear each other's capture pending.
 LLAMA_API void llama_kvmem_capture_on_new_graph(int is_mtp);
 LLAMA_API void llama_kvmem_harvest_ubatch(struct ggml_backend_sched * sched, int is_mtp);
+// Every actual ubatch, before memory apply/graph execution, including graph reuse.
+LLAMA_API bool llama_kvmem_before_ubatch(struct ggml_backend_sched * sched,
+                                      uint32_t n_tokens, const llama_pos * rows, int is_mtp);
 // True when this ubatch overlaps [query_begin, query_end) and Q nodes should
 // be present. n_pos is the per-token position stride (1 for 1-D RoPE).
 LLAMA_API bool llama_kvmem_ubatch_needs_q_capture(uint32_t n_tokens, uint32_t n_pos,
@@ -163,6 +166,7 @@ LLAMA_API void llama_kvmem_dump_kv_writeback(struct llama_context * ctx, int32_t
 }
 
 #include <vector>
+#include <utility>
 #include <string>
 
 namespace kvmem { class SnapshotWriter; class SnapshotReader; struct SnapshotBuffer; }
@@ -195,6 +199,7 @@ struct llama_kvmem_turn_spans {
 struct llama_kvmem_query_state {
     std::vector<std::vector<float>> sum;
     std::vector<uint32_t> count;
+    bool approximate = false;
 };
 struct llama_kvmem_attention_view {
     uint64_t epoch = 0;
@@ -220,4 +225,75 @@ LLAMA_API bool llama_kvmem_set_query(const llama_kvmem_query_state & state);
 LLAMA_API void llama_kvmem_freeze_query(bool frozen);
 LLAMA_API void llama_kvmem_get_tail_mean(uint32_t row, std::vector<float> & state);
 LLAMA_API void llama_kvmem_set_tail_mean(uint32_t row, const std::vector<float> & state);
+
+// Conversation pool: host-side KV of one whole sequence, detached from the live
+// slot. take leaves the live memory empty (caller then llama_memory_clear's both
+// contexts). Both put variants ALWAYS consume the stash, including invalid
+// rows, missing live memory and restore failure; callers must relinquish their
+// pointer before calling. put restores all rows; put_prefix requires
+// 0 < rows <= stash rows and trims on the host before uploading. fork retains
+// its source. Restore requires empty live memory; failure leaves it empty.
+// A nonempty live memory is rejected without changing it.
+struct llama_kvmem_stash;
+LLAMA_API llama_kvmem_stash * llama_kvmem_stash_take(uint32_t max_rows, uint32_t * rows);
+LLAMA_API bool llama_kvmem_stash_put(llama_kvmem_stash * stash);
+LLAMA_API bool llama_kvmem_stash_put_prefix(llama_kvmem_stash * stash, uint32_t rows);
+LLAMA_API bool llama_kvmem_stash_fork(const llama_kvmem_stash * stash, uint32_t rows);
+LLAMA_API size_t llama_kvmem_stash_bytes(const llama_kvmem_stash * stash);
+LLAMA_API void llama_kvmem_stash_free(llama_kvmem_stash * stash);
+
+// Future forks: true = shared packed payloads with COW (default), false = deep
+// copy. Read once per fork for both target and MTP. Existing branches are not
+// converted; drain the pool before changing modes for an A/B comparison.
+LLAMA_API void llama_kvmem_set_pool_copy(bool cow);
+
+// GPU same-slot ancestor reuse defaults OFF. Configure between operations on
+// the inference thread. Unsupported layouts/tier modes decline begin safely.
+LLAMA_API void llama_kvmem_set_pool_gpu_reuse(bool enabled);
+// Scope only around stash_take + memory_clear_all(target AND draft). Do not
+// nest. On any failure call end(false), then normal full clear/cold fallback.
+// Caller synchronizes both graph contexts before begin/take; these controls
+// do not own llama_context handles and cannot fence their scheduler streams.
+// A successful end preserves tags, but subsequent clears default to full reset.
+LLAMA_API bool llama_kvmem_pool_preserve_begin();
+LLAMA_API void llama_kvmem_pool_preserve_end(bool success);
+// Budget pressure: drop hint owners, then rebuild the allocation snapshot.
+// Does not alter live attention or slot ownership.
+LLAMA_API void llama_kvmem_drop_resident_tags();
+// External KV writers (e.g. future PIC import) must call this BEFORE writes.
+// Invalidates proof and resident host packed validity; it is not the budget hook.
+LLAMA_API void llama_kvmem_notify_external_kv_write();
+struct llama_kvmem_resident_stats {
+    uint64_t hit_blocks = 0;
+    uint64_t miss_blocks = 0;
+    uint64_t skipped_target_bytes = 0;
+    uint64_t skipped_mtp_bytes = 0;
+};
+LLAMA_API bool llama_kvmem_get_resident_stats(llama_kvmem_resident_stats & out);
+
+namespace kvmem_pic { struct kv_splice_plan; }
+LLAMA_API bool llama_kvmem_pic_bind_epoch(uint64_t epoch, std::string & error);
+LLAMA_API bool llama_kvmem_pic_kv_commit(const kvmem_pic::kv_splice_plan & plan, std::string & error);
+// Diagnostic only: publish the last commit's upload call/byte counts.
+LLAMA_API void llama_kvmem_pic_report_uploads(uint64_t calls, uint64_t bytes);
+LLAMA_API bool llama_kvmem_pic_is_approximate();
+LLAMA_API bool llama_kvmem_pic_is_poisoned();
+LLAMA_API bool llama_kvmem_stash_is_approximate(const llama_kvmem_stash * stash);
+
+// Append non-owning (allocation identity, capacity bytes) entries; deduplicate
+// identities across ALL retained stash/live owners for unique/reclaimable bytes.
+// Call on the inference thread between operations, retain owners, and allow no
+// writes/take/put/eviction across the entire snapshot. Live drains pending host
+// writes first. These identities are accounting keys, not GPU page versions.
+// Includes RawKvStore's reported allocations, row/resident vector capacities,
+// stash/runtime objects, runtime block tables and resident-tag leases/metadata.
+// Tag leases count as LIVE owners even when the live runtime is empty.
+// Excludes runtime tier arenas,
+// plan/scratch buffers, fixed adapter state, GPU memory, checkpoints/Q and
+// allocator overhead. stash_bytes remains the legacy logical payload total.
+// False = absent owner or collection failure; existing out entries are retained
+// and any partially appended entries are removed. Never consumes the owner.
+LLAMA_API bool llama_kvmem_stash_allocations(
+        const llama_kvmem_stash * stash, std::vector<std::pair<const void *, size_t>> & out);
+LLAMA_API bool llama_kvmem_live_allocations(std::vector<std::pair<const void *, size_t>> & out);
 #endif

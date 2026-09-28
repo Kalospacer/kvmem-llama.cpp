@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace kvmem {
@@ -50,6 +51,10 @@ public:
 
     void ensure_blocks(uint32_t block_count);
 
+    // Raw K and packed GPU K are separate representations and may coexist;
+    // raw-K writes do not invalidate packed K. Replay invalidates explicitly.
+    // A non-null V replaces the packed-V representation in each touched block,
+    // clearing its valid count. Switching back requires refilling packed rows.
     void write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
                             const float * k, const float * v);
     void write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
@@ -81,6 +86,8 @@ public:
     // Normalize the stored sum by mean_tokens; absent statistics return zeros.
     void mean_k(uint32_t block_id, uint32_t il, float * out) const;
 
+    // Legacy per-store logical sizes (shared payload counted in each store),
+    // plus NVMe write counters; not resident capacity or unique memory.
     size_t bytes_k() const;
     size_t bytes_v() const;
     size_t allocated_bytes() const;
@@ -90,6 +97,25 @@ public:
     // Caller freezes the detached store until all bindings have been restored.
     void snapshot_buffers(std::vector<SnapshotBuffer> & buffers);
 
+    // Append allocation identity/bytes; deduplicate identities across stores.
+    // Counts sizeof(*this), vector capacities (including private block/layer
+    // metadata, raw K/V, k_sum and scratch/queued I/O), packed vector objects
+    // and their byte capacities, and heap storage of config strings.
+    // Excludes allocator/shared_ptr control-block overhead, NVMe tier internals,
+    // disk bytes, worker-local in-flight I/O and thread/OS resources.
+    // Entries do not own memory. Quiesce harvest/writers and retain all stores
+    // throughout a multi-store snapshot; this call only locks this store.
+    void append_allocations(std::vector<std::pair<const void*, size_t>>& out) const;
+
+    // Immutable packed leases for a completed GPU capture. These keep payload
+    // identity alive and force later writers through COW. Caller fences harvest.
+    bool packed_refs(uint32_t block_id, uint32_t il, uint32_t rows,
+                     std::shared_ptr<const std::vector<uint8_t>> & k,
+                     std::shared_ptr<const std::vector<uint8_t>> & v) const;
+    // A graph will overwrite this block starting at keep_rows. Other blocks'
+    // backing copies remain valid, including nonresident historical blocks.
+    void invalidate_packed_block(uint32_t block_id, uint32_t keep_rows);
+
     uint64_t nvme_bytes_written() const;
     uint64_t nvme_syscalls() const;
     uint64_t nvme_wait_ns() const;
@@ -98,12 +124,21 @@ public:
     void clear();
     // Preserve only the valid prefix, including a partial last block.
     void truncate_to(uint32_t token_pos);
+    // Share each layer's packed K/V; metadata, raw K/V and k_sum stay private.
+    // RAM only (both clone methods throw for NVMe). Caller must complete
+    // asynchronous harvest before publishing a branch; shared_ptr is not a fence.
+    std::unique_ptr<RawKvStore> clone_prefix(uint32_t token_pos) const;
+    std::unique_ptr<RawKvStore> clone_prefix_deep(uint32_t token_pos) const;
     void invalidate_packed_from(uint32_t token_pos);
     // In-process tail checkpoint: per layer, valid count followed by the F32 sum.
     std::vector<float> mean_checkpoint(uint32_t token_pos) const;
     void restore_mean_checkpoint(uint32_t token_pos, const std::vector<float> & state);
 
 private:
+    using PackedPayload = std::shared_ptr<std::vector<uint8_t>>;
+    static const std::vector<uint8_t> & payload(const PackedPayload & p);
+    static std::vector<uint8_t> & writable_payload(PackedPayload & p);
+    void ensure_blocks_locked(uint32_t block_count);
     struct LayerBlk {
         uint32_t n_tokens = 0;
         uint32_t k_gpu_tokens = 0;
@@ -111,8 +146,8 @@ private:
         uint32_t mean_tokens = 0;
         std::vector<uint8_t> k;
         std::vector<uint16_t> v;
-        std::vector<uint8_t> k_gpu;
-        std::vector<uint8_t> v_gpu;
+        PackedPayload k_gpu;
+        PackedPayload v_gpu;
         std::vector<float> k_sum;
         bool k_on_nvme = false;
         bool v_on_nvme = false;

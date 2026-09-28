@@ -1,6 +1,12 @@
 # llama.cpp patch replay
 
 `llama-kvmem-current.patch` is the cumulative diff against pinned `b81c99b`.
+It also includes the cache revision ubatch fence, recurrent rollback floor and
+disabled-by-default PIC capture integration. See [cache revision status](../docs/cache-revision.md).
+`cache-revision-upgrade.patch` updates the previous rc3 patched tree to this
+cumulative state; `cache-revision-base.patch` records that old state for the
+Windows build script's preflight check. Do not apply the base patch on top of the
+new cumulative patch.
 It includes the existing KVMem hooks, multimodal batch, MTP, media
 parser and mtmd helper extensions, plus FP32 GDN Record/Fold for ReplaySSM.
 It also fixes reasoning-budget initialization from a template's generation prefix.

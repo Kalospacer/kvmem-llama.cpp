@@ -26,6 +26,12 @@ public:
     bool get_can_shift() const override { return false; }
 
     void clear(bool data) override;
+    llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
+    void seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) override;
+    void seq_add(llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos shift) override;
+    void seq_div(llama_seq_id seq, llama_pos p0, llama_pos p1, int d) override;
+    void state_read(llama_io_read_i & io, llama_seq_id seq = -1, llama_state_seq_flags flags = 0) override;
 
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 

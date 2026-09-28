@@ -267,6 +267,8 @@ if (KVMEM_BUILD_LLAMA)
     target_include_directories(llama-kvmem-server PRIVATE
         kvmem/include
         src/adapter
+        llama.cpp/src
+        kvmem/include
         llama.cpp/include
         llama.cpp/common
         llama.cpp/tools/server
@@ -308,7 +310,8 @@ if (KVMEM_BUILD_LLAMA)
         set_tests_properties(kvmem-mtp-kv-test PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
-    add_executable(kvmem-gdn-replay-test tests/gdn-replay-test.cpp)
+    add_executable(kvmem-gdn-replay-test tests/gdn-replay-test.cpp
+        src/adapter/llama-kvmem-pic-math.cpp src/adapter/pic-rope.cpp)
     target_link_libraries(kvmem-gdn-replay-test PRIVATE ggml)
     add_test(NAME kvmem-gdn-replay-test COMMAND kvmem-gdn-replay-test)
     set_tests_properties(kvmem-gdn-replay-test PROPERTIES SKIP_RETURN_CODE 77)
@@ -333,6 +336,10 @@ if (KVMEM_BUILD_LLAMA)
     add_test(NAME kvmem-server-options-test COMMAND kvmem-server-options-test)
 
     find_package(Threads REQUIRED)
+    add_executable(kvmem-pic-store-test tests/pic-store-test.cpp
+        src/adapter/llama-kvmem-pic-store.cpp)
+    target_link_libraries(kvmem-pic-store-test PRIVATE ggml Threads::Threads)
+    add_test(NAME kvmem-pic-store-test COMMAND kvmem-pic-store-test)
     add_executable(kvmem-server-progress-test tests/server-progress-test.cpp)
     target_include_directories(kvmem-server-progress-test PRIVATE tools llama.cpp/vendor)
     target_link_libraries(kvmem-server-progress-test PRIVATE Threads::Threads)

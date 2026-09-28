@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -135,6 +136,20 @@ void llama_kvmem_capture_on_new_graph(int is_mtp) {
 
 void llama_kvmem_harvest_ubatch(struct ggml_backend_sched * sched, int is_mtp) {
     kvmem_capture_harvest_ubatch(sched, is_mtp);
+}
+
+bool llama_kvmem_before_ubatch(struct ggml_backend_sched * sched,
+                              uint32_t n_tokens, const llama_pos * rows, int is_mtp) {
+    if (!g_mem || !g_mem->gpu_reuse_requested()) return true;
+    try {
+        if (sched) ggml_backend_sched_synchronize(sched);
+        return is_mtp ? (!g_mtp || g_mtp->before_ubatch(n_tokens, rows))
+                      : g_mem->before_ubatch(n_tokens, rows);
+    } catch (const std::exception & e) {
+        g_mem->pool_preserve_end(false);
+        fprintf(stderr, "%s: %s\n", __func__, e.what());
+        return false;
+    }
 }
 
 bool llama_kvmem_ubatch_needs_q_capture(uint32_t n_tokens, uint32_t n_pos, const llama_pos * pos) {

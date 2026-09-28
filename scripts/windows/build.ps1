@@ -38,6 +38,8 @@ if (!$HostOnly) {
     # Use the maintained patch, never the developer's unrecorded submodule edits.
     $llama = Join-Path $SourceDir 'llama.cpp'
     $patch = Join-Path $SourceDir 'patches/llama-kvmem-current.patch'
+    $cacheBase = Join-Path $SourceDir 'patches/cache-revision-base.patch'
+    $cacheUpgrade = Join-Path $SourceDir 'patches/cache-revision-upgrade.patch'
     $savedPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
@@ -45,8 +47,19 @@ if (!$HostOnly) {
         $applied = $LASTEXITCODE -eq 0
     } finally { $ErrorActionPreference = $savedPreference }
     if (!$applied) {
-        Invoke-Checked git @('-C', $llama, 'apply', '--check', $patch)
-        Invoke-Checked git @('-C', $llama, 'apply', $patch)
+        try {
+            $ErrorActionPreference = 'Continue'
+            & git -C $llama apply --reverse --check $cacheBase 2>$null
+            $oldBaseline = $LASTEXITCODE -eq 0
+        } finally { $ErrorActionPreference = $savedPreference }
+        if ($oldBaseline) {
+            Invoke-Checked git @('-C', $llama, 'apply', '--check', $cacheUpgrade)
+            Invoke-Checked git @('-C', $llama, 'apply', $cacheUpgrade)
+        } else {
+            Invoke-Checked git @('-C', $llama, 'apply', '--check', $patch)
+            Invoke-Checked git @('-C', $llama, 'apply', $patch)
+        }
+        Invoke-Checked git @('-C', $llama, 'apply', '--reverse', '--check', $patch)
     }
 }
 $options = @('-S', $SourceDir, '-B', $BuildDir, '-G', 'Ninja',
@@ -95,11 +108,12 @@ $targets = @('kvmem_store_test', 'pinned_kv_tier_test',
 if (!$HostOnly) {
     $targets += @('llama-kvmem-server', 'llama-kvmem-cli', 'llama-quantize',
         'kvmem-chat-id-test', 'kvmem-reasoning-budget-test', 'kvmem-chat-template-test', 'kvmem-server-options-test',
-        'kvmem-server-progress-test', 'kvmem-output-limit-test', 'kvmem-responses-test')
+        'kvmem-server-progress-test', 'kvmem-output-limit-test', 'kvmem-responses-test',
+        'kvmem-pic-store-test', 'kvmem-gdn-replay-test')
 }
 Invoke-Checked cmake (@('--build', $BuildDir, '--parallel', "$Jobs", '--target') + $targets)
 if (!$BuildOnly) {
     Invoke-Checked ctest @('--test-dir', $BuildDir, '--output-on-failure', '-R',
-        '^(kvmem_store_test|pinned_kv_tier_test|kvmem-conversation-store-test|kvmem-session-snapshot-test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test|kvmem-responses-test)$')
+        '^(kvmem_store_test|pinned_kv_tier_test|kvmem-conversation-store-test|kvmem-session-snapshot-test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test|kvmem-responses-test|kvmem-pic-store-test|kvmem-gdn-replay-test)$')
     Write-Host "Built and tested: $BuildDir"
 } else { Write-Host "Built only; runtime tests NOT run: $BuildDir" }

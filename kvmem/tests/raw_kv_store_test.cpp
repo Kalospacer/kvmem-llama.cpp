@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <map>
+#include <stdexcept>
 #include <vector>
 
 #define CHECK(cond)                                                            \
@@ -184,9 +186,268 @@ static void test_store_bytes() {
 
     raw.clear();
     CHECK(raw.bytes_k() == 0 && raw.bytes_v() == 0);
+using Allocations = std::map<const void *, size_t>;
+
+static Allocations allocations(const kvmem::RawKvStore & raw) {
+    std::vector<std::pair<const void *, size_t>> entries;
+    raw.append_allocations(entries);
+    const auto count = entries.size();
+    raw.append_allocations(entries); // Appends; identities are stable across reads.
+    CHECK(entries.size() == 2 * count);
+    Allocations result;
+    for (const auto & entry : entries) {
+        CHECK(entry.first && entry.second);
+        const auto inserted = result.emplace(entry);
+        CHECK(inserted.second || inserted.first->second == entry.second);
+    }
+    CHECK(result.size() == count);
+    return result;
+}
+
+static size_t allocation_bytes(const Allocations & entries) {
+    size_t bytes = 0;
+    for (const auto & entry : entries) bytes += entry.second;
+    return bytes;
+}
+
+static Allocations shared_allocations(const kvmem::RawKvStore & a, const kvmem::RawKvStore & b) {
+    const auto aa = allocations(a);
+    const auto bb = allocations(b);
+    Allocations shared;
+    for (const auto & entry : aa) {
+        const auto it = bb.find(entry.first);
+        if (it != bb.end()) {
+            CHECK(it->second == entry.second);
+            shared.insert(entry);
+        }
+    }
+    return shared;
+}
+
+static void check_packed(const kvmem::RawKvStore & raw, uint32_t bid, uint32_t il,
+                         bool is_k, const std::vector<uint8_t> & expected) {
+    const auto row = is_k ? raw.config().k_gpu_row_bytes : raw.config().v_gpu_row_bytes;
+    CHECK(row && expected.size() % row == 0);
+    const auto n = static_cast<uint32_t>(expected.size() / row);
+    std::vector<uint8_t> got(expected.size());
+    CHECK(is_k ? raw.copy_k_gpu(bid, il, got.data(), n) : raw.copy_v_gpu(bid, il, got.data(), n));
+    CHECK(got == expected);
+}
+
+static void test_packed_cow() {
+    kvmem::RawKvStoreConfig cfg;
+    cfg.n_layer = 2;
+    cfg.n_embd_k = cfg.n_embd_v = 3;
+    cfg.block_tokens = 4;
+    cfg.k_gpu_row_bytes = 7;
+    cfg.v_gpu_row_bytes = 11;
+    kvmem::RawKvStore parent(cfg);
+    std::vector<uint8_t> k(9 * 7, 17), v(9 * 11, 29);
+    std::vector<float> means(9 * 3, 2.0f);
+    for (uint32_t il = 0; il < 2; ++il) {
+        parent.write_layer_k_gpu(0, 9, il, k.data());
+        parent.write_layer_v_gpu(0, 9, il, v.data());
+        parent.write_layer_mean_k(0, 6, il, means.data());
+    }
+    const auto checkpoint = parent.mean_checkpoint(6);
+    for (uint32_t il = 0; il < 2; ++il) parent.write_layer_mean_k(6, 3, il, means.data());
+    const auto parent_ids = allocations(parent);
+    auto child = parent.clone_prefix(6);
+    auto sibling = parent.clone_prefix(9);
+    auto deep = parent.clone_prefix_deep(6);
+    CHECK(allocations(parent) == parent_ids);
+    CHECK(shared_allocations(parent, *deep).empty());
+    CHECK(shared_allocations(*child, *deep).empty());
+    // Both the vector object and its actual byte allocation are shared, for
+    // every retained block/layer/K-or-V, including the clipped tail.
+    const size_t one_k = sizeof(std::vector<uint8_t>) + 4 * 7;
+    const size_t one_v = sizeof(std::vector<uint8_t>) + 4 * 11;
+    const auto shared = shared_allocations(parent, *child);
+    CHECK(shared.size() == 2 * 2 * 2 * 2);
+    CHECK(allocation_bytes(shared) == 2 * 2 * (one_k + one_v));
+    CHECK(shared_allocations(parent, *sibling).size() == 3 * 2 * 2 * 2);
+    auto unique = parent_ids;
+    const auto child_ids = allocations(*child);
+    unique.insert(child_ids.begin(), child_ids.end());
+    CHECK(allocation_bytes(unique) == allocation_bytes(parent_ids) + allocation_bytes(child_ids)
+                                      - allocation_bytes(shared));
+    CHECK(child->n_tokens(1) == 2 && parent.n_tokens(1) == 4);
+    CHECK(!child->has_k_gpu(1, 0, 3) && !child->has_v_gpu(1, 0, 3));
+    check_packed(*child, 1, 0, true, std::vector<uint8_t>(2 * 7, 17));
+    check_packed(*deep, 1, 0, false, std::vector<uint8_t>(2 * 11, 29));
+
+    // Checkpoint/mean mutations never detach packed storage or affect siblings.
+    child->restore_mean_checkpoint(6, checkpoint);
+    std::vector<float> sum(3, 8.0f), got(3);
+    child->write_layer_mean_sum(6, 1, 0, sum.data());
+    child->mean_k(1, 0, got.data());
+    CHECK(got[0] == 4.0f);
+    parent.mean_k(1, 0, got.data());
+    CHECK(got[0] == 2.0f);
+    sibling->mean_k(1, 0, got.data());
+    CHECK(got[0] == 2.0f);
+    CHECK(shared_allocations(parent, *child) == shared);
+    CHECK(!child->has_k_gpu(1, 0, 3));
+    child->truncate_to(6);
+    child->restore_mean_checkpoint(6, checkpoint);
+
+    // An overwrite detaches just this layer's K; V and other layers stay shared.
+    std::vector<uint8_t> other_k(4 * 7, 91), other_v(4 * 11, 103);
+    child->write_layer_k_gpu(0, 4, 0, other_k.data());
+    CHECK(allocation_bytes(shared_allocations(parent, *child)) == allocation_bytes(shared) - one_k);
+    check_packed(parent, 0, 0, true, std::vector<uint8_t>(4 * 7, 17));
+    check_packed(*child, 0, 0, true, other_k);
+    const auto detached = allocations(*child);
+    child->write_layer_k_gpu(1, 1, 0, other_k.data());
+    CHECK(allocations(*child) == detached); // Unique payload reused on hot writes.
+    sibling->write_layer_v_gpu(0, 4, 1, other_v.data());
+    CHECK(allocation_bytes(shared_allocations(parent, *sibling)) == 3 * 2 * (one_k + one_v) - one_v);
+    check_packed(parent, 0, 1, false, std::vector<uint8_t>(4 * 11, 29));
+    check_packed(*child, 0, 1, false, std::vector<uint8_t>(4 * 11, 29));
+
+    // Replay invalidation is branch-local. Refill crosses the partial tail and
+    // allocates a new block without making old suffix bytes valid again.
+    const auto before_invalidate = shared_allocations(parent, *child);
+    child->invalidate_packed_from(5);
+    CHECK(shared_allocations(parent, *child) == before_invalidate);
+    CHECK(!child->has_k_gpu(1, 0, 2) && !child->has_v_gpu(1, 0, 2));
+    CHECK(parent.has_k_gpu(1, 0, 4) && sibling->has_v_gpu(1, 0, 4));
+    child->write_layer_k_gpu(5, 4, 0, other_k.data());
+    child->write_layer_v_gpu(5, 4, 0, other_v.data());
+    std::vector<uint8_t> tail_k(4 * 7, 91), tail_v(4 * 11, 103);
+    std::fill_n(tail_k.begin(), 7, 17);
+    std::fill_n(tail_v.begin(), 11, 29);
+    check_packed(*child, 1, 0, true, tail_k);
+    check_packed(*child, 1, 0, false, tail_v);
+    check_packed(parent, 1, 0, true, std::vector<uint8_t>(4 * 7, 17));
+    check_packed(*sibling, 1, 0, false, std::vector<uint8_t>(4 * 11, 29));
+    check_packed(*child, 2, 0, true, std::vector<uint8_t>(7, 91));
+    CHECK(!child->has_k_gpu(2, 0, 2));
+
+    // Mutating the original after publication must detach too.
+    parent.write_layer_k_gpu(3, 4, 1, other_k.data());
+    check_packed(*sibling, 0, 1, true, std::vector<uint8_t>(4 * 7, 17));
+    check_packed(*child, 0, 1, true, std::vector<uint8_t>(4 * 7, 17));
+    sibling->truncate_to(4);
+    CHECK(!sibling->has_block(1) && parent.has_block(1) && child->has_block(1));
+    parent.clear();
+    sibling.reset();
+    check_packed(*child, 1, 0, true, tail_k);
+    check_packed(*child, 0, 1, false, std::vector<uint8_t>(4 * 11, 29));
+    const auto last_owner = allocations(*child);
+    child->write_layer_v_gpu(0, 1, 1, other_v.data());
+    CHECK(allocations(*child) == last_owner);
+    check_packed(*deep, 1, 0, true, std::vector<uint8_t>(2 * 7, 17));
+    child->clear();
+    CHECK(child->bytes_k() == 0 && child->bytes_v() == 0);
+    CHECK(allocation_bytes(allocations(*child)) < allocation_bytes(last_owner));
+    // Retained vector capacity remains charged after clear.
+    CHECK(allocation_bytes(allocations(*child)) > sizeof(kvmem::RawKvStore));
+}
+
+static void test_cow_boundaries() {
+    kvmem::RawKvStoreConfig cfg;
+    cfg.n_layer = 1;
+    cfg.block_tokens = 128;
+    cfg.k_gpu_row_bytes = cfg.v_gpu_row_bytes = 3;
+    kvmem::RawKvStore parent(cfg);
+    std::vector<uint8_t> rows(256 * 3, 42), replacement(2 * 3, 99);
+    parent.write_layer_k_gpu(0, 256, 0, rows.data());
+    parent.write_layer_v_gpu(0, 256, 0, rows.data());
+    for (uint32_t pos : {0u, 1u, 127u, 128u, 129u, 256u}) {
+        auto branch = parent.clone_prefix(pos);
+        const auto kept = (pos + 127) / 128;
+        CHECK(shared_allocations(parent, *branch).size() == kept * 4);
+        CHECK(branch->n_tokens(pos / 128) == pos % 128);
+        branch->write_layer_k_gpu(pos, 2, 0, replacement.data());
+        branch->write_layer_v_gpu(pos, 2, 0, replacement.data());
+        check_packed(parent, 0, 0, true, std::vector<uint8_t>(128 * 3, 42));
+        check_packed(parent, 1, 0, false, std::vector<uint8_t>(128 * 3, 42));
+        for (uint32_t bid = 0; bid * 128 < pos + 2; ++bid) {
+            const uint32_t n = std::min(128u, pos + 2 - bid * 128);
+            std::vector<uint8_t> expected(n * 3);
+            for (uint32_t t = 0; t < n; ++t) {
+                std::fill_n(expected.begin() + t * 3, 3, bid * 128 + t < pos ? 42 : 99);
+            }
+            check_packed(*branch, bid, 0, true, expected);
+            check_packed(*branch, bid, 0, false, expected);
+        }
+    }
+}
+
+static void test_legacy_and_mean_isolation() {
+    kvmem::RawKvStoreConfig cfg;
+    cfg.n_layer = 2;
+    cfg.n_embd_k = cfg.n_embd_v = 3;
+    cfg.block_tokens = 4;
+    cfg.k_gpu_row_bytes = cfg.v_gpu_row_bytes = 7;
+    kvmem::RawKvStore parent(cfg);
+    std::vector<float> ones(6 * 3, 1.0f), twos(6 * 3, 2.0f), got(4 * 3);
+    std::vector<uint16_t> halves(6 * 3, 0x4000); // 2.0
+    std::vector<uint8_t> packed(6 * 7, 31);
+    parent.write_layer_tokens(0, 6, 0, ones.data(), ones.data());
+    parent.write_layer_k_gpu(0, 6, 0, packed.data());
+    parent.write_layer_v_gpu(0, 6, 0, packed.data());
+    auto a = parent.clone_prefix(6);
+    auto b = parent.clone_prefix(6);
+    a->write_layer_tokens(3, 3, 0, twos.data(), twos.data());
+    b->write_layer_tokens_f16(3, 3, 0, halves.data(), halves.data());
+    for (auto * branch : {a.get(), b.get()}) {
+        CHECK(branch->copy_k(0, 0, got.data()));
+        CHECK(got[0] == 1.0f && got[9] == 2.0f);
+        CHECK(branch->copy_v(1, 0, got.data()) && got[0] == 2.0f);
+        CHECK(!branch->has_v_gpu(0, 0));
+        CHECK(shared_allocations(parent, *branch).size() == 2 * 2); // Only packed K remains shared.
+        // Switching packed V -> F32/F16 V -> packed V must not resurrect the
+        // old valid count. Exercise both a full block and a partial tail.
+        for (uint32_t bid : {0u, 1u}) {
+            const uint32_t old_rows = bid == 0 ? 4 : 2;
+            const uint32_t pos = bid * cfg.block_tokens;
+            std::vector<uint8_t> replacement(old_rows * 7, 99), copied(old_rows * 7, 211);
+            branch->write_layer_v_gpu(pos, 1, 0, replacement.data());
+            CHECK(branch->n_tokens(bid) == old_rows);
+            CHECK(branch->has_v_gpu(bid, 0, 1));
+            CHECK(!branch->has_v_gpu(bid, 0, 2));
+            CHECK(!branch->copy_v_gpu(bid, 0, copied.data(), old_rows));
+            CHECK(copied == std::vector<uint8_t>(old_rows * 7, 211));
+            check_packed(*branch, bid, 0, false, std::vector<uint8_t>(7, 99));
+            check_packed(parent, bid, 0, false, std::vector<uint8_t>(old_rows * 7, 31));
+            branch->write_layer_v_gpu(pos + 1, old_rows - 1, 0, replacement.data() + 7);
+            check_packed(*branch, bid, 0, false, replacement);
+            check_packed(parent, bid, 0, false, std::vector<uint8_t>(old_rows * 7, 31));
+        }
+    }
+    CHECK(parent.copy_k(0, 0, got.data()) && got[9] == 1.0f);
+    check_packed(parent, 1, 0, false, std::vector<uint8_t>(2 * 7, 31));
+    a->truncate_to(1);
+    a->mean_k(0, 0, got.data());
+    CHECK(got[0] == 1.0f);
+    parent.mean_k(0, 0, got.data());
+    CHECK(got[0] == 1.0f);
+    b->write_layer_mean_k(0, 4, 0, twos.data());
+    b->mean_k(0, 0, got.data());
+    CHECK(got[0] == 2.0f);
+    parent.mean_k(0, 0, got.data());
+    CHECK(got[0] == 1.0f);
+
+    // Opaque raw rows and their statistics are copied privately as well.
+    cfg.k_row_bytes = 5;
+    kvmem::RawKvStore opaque(cfg);
+    std::vector<uint8_t> rows(6 * 5, 13), changed(3 * 5, 77), copied(4 * 5);
+    opaque.write_layer_k_rows(0, 6, 1, rows.data(), ones.data());
+    auto c = opaque.clone_prefix(6);
+    CHECK(shared_allocations(opaque, *c).empty());
+    c->write_layer_k_rows(3, 3, 1, changed.data(), twos.data());
+    CHECK(c->copy_k_rows(0, 1, copied.data(), 4) && copied[0] == 13 && copied[15] == 77);
+    CHECK(opaque.copy_k_rows(0, 1, copied.data(), 4) && copied[15] == 13);
+    opaque.mean_k(0, 1, got.data());
+    CHECK(got[0] == 1.0f);
 }
 
 int main() {
+    test_packed_cow();
+    test_cow_boundaries();
+    test_legacy_and_mean_isolation();
     test_sum_only(32);
     test_sum_only(128);
     test_sibling_stores_are_independent();
@@ -271,6 +532,15 @@ int main() {
     ncfg.nvme_bytes = 4ull * 1024ull * 1024ull;
     kvmem::RawKvStore rawn(ncfg);
     CHECK(rawn.nvme_enabled());
+    for (bool deep : {false, true}) {
+        bool rejected = false;
+        try {
+            auto clone = deep ? rawn.clone_prefix_deep(1) : rawn.clone_prefix(1);
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        CHECK(rejected);
+    }
     std::vector<float> kfull(16, 0.0f);
     for (int i = 0; i < 16; ++i) {
         kfull[i] = static_cast<float>(i);
@@ -475,6 +745,37 @@ int main() {
         CHECK(!tail_store.has_v_gpu(0, 0, 4));
         CHECK(tail_store.copy_k_gpu(0, 0, gout4.data(), 3));
         CHECK(tail_store.copy_v_gpu(0, 0, gout4.data(), 3));
+    }
+    {
+        // clone_prefix: shared first rows, partial tail block kept.
+        kvmem::RawKvStoreConfig ccfg;
+        ccfg.n_layer = 1;
+        ccfg.n_embd_k = 4;
+        ccfg.n_embd_v = 4;
+        ccfg.block_tokens = 2;
+        ccfg.k_gpu_row_bytes = 3;
+        ccfg.v_gpu_row_bytes = 3;
+        kvmem::RawKvStore src(ccfg);
+        std::vector<uint8_t> rows(15);
+        for (int i = 0; i < 15; ++i) rows[static_cast<size_t>(i)] = static_cast<uint8_t>(i + 1);
+        for (uint32_t pos = 0; pos < 5; pos += 2) {
+            const uint32_t n = pos + 2 <= 5 ? 2 : 1;
+            src.write_layer_k_gpu(pos, n, 0, rows.data() + pos * 3);
+            src.write_layer_v_gpu(pos, n, 0, rows.data() + pos * 3);
+        }
+        auto clone = src.clone_prefix(3);
+        CHECK(clone->has_k_gpu(0, 0, 2) && clone->has_v_gpu(0, 0, 2));
+        CHECK(clone->has_k_gpu(1, 0, 1) && !clone->has_k_gpu(1, 0, 2));
+        CHECK(!clone->has_k_gpu(2, 0, 1));
+        CHECK(src.has_k_gpu(1, 0, 2) && src.has_k_gpu(2, 0, 1));
+        std::vector<uint8_t> got(6, 0);
+        CHECK(clone->copy_k_gpu(1, 0, got.data(), 1));
+        CHECK(got[0] == 7 && got[2] == 9);
+        std::vector<uint8_t> other(6, 200);
+        clone->write_layer_k_gpu(0, 2, 0, other.data());
+        CHECK(src.copy_k_gpu(0, 0, got.data(), 2));
+        CHECK(got[0] == 1 && got[5] == 6);
+        CHECK(src.clone_prefix(0)->bytes_k() == 0);
     }
     return 0;
 }
