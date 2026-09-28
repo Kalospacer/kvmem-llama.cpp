@@ -305,7 +305,8 @@ private:
     void harvest_write_batch();
     // After a prefill graph, enqueue packed K/V D2H for GPU-resident
     // full blocks. Does not wait; apply_plan / retrieval commit.
-    void harvest_full_blocks_async();
+    // done_before > 0: rows below it are final (reuse mode harvests only those).
+    void harvest_full_blocks_async(llama_pos done_before = -1);
     void decode_mean_ingest(struct ggml_backend_sched * sched);
     void decode_mean_reset();
     void decode_mean_add_range(uint32_t tok0, uint32_t n_add);
@@ -333,6 +334,10 @@ private:
     std::vector<uint8_t> harvest_gpu_queued_;
     // Harvest jobs that missed the async stage-out slab and copied synchronously.
     uint64_t harvest_sync_jobs_ = 0;
+    // Stage-out time split: waiting on the D2H copy vs writing into raw_.
+    int64_t harvest_wait_us_ = 0;
+    int64_t harvest_write_us_ = 0;
+    uint64_t harvest_submits_ = 0;
     void copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_slot,
                                 void * host, uint64_t bytes);
     void copy_gpu_block_from_host(uint32_t block_id, int32_t gpu_slot,

@@ -3168,12 +3168,18 @@ void llama_memory_kvmem::harvest_pending(ggml_backend_sched_t sched) {
     if (d2h_ && d2h_->ok && !harvest_worker_on()) {
         d2h_commit(d2h_->next == 0 ? 1 : 0);
     }
+    // First row of the ubatch that just completed, for a prefill-sized ubatch.
+    // Rows below it were written by earlier ubatches and are final.
+    llama_pos done_before = -1;
+    if (!pos_queue_.empty() && pos_queue_.front().size() >= 32) {
+        done_before = *std::min_element(pos_queue_.front().begin(), pos_queue_.front().end());
+    }
     if (pending_capture_.empty() || pos_queue_.empty()) {
         harvest_flush();
         if (sched) {
             ggml_backend_sched_synchronize(sched);
         }
-        harvest_full_blocks_async();
+        harvest_full_blocks_async(done_before);
         return;
     }
     if (multi_gpu_) {
@@ -3231,7 +3237,7 @@ void llama_memory_kvmem::harvest_pending(ggml_backend_sched_t sched) {
             ggml_backend_sched_synchronize(sched);
         }
     }
-    harvest_full_blocks_async();
+    harvest_full_blocks_async(done_before);
     const int64_t entry_us = ggml_time_us() - t_entry;
     perf_.harvest_entry_us += entry_us;
     perf_.n_ubatch += 1;
@@ -3498,16 +3504,21 @@ void llama_memory_kvmem::harvest_gpu_v_flush_slab() {
         return;
     }
     int64_t * gpu_us = retr_.enabled ? &retr_.stage_out_gpu_us : nullptr;
+    ++harvest_submits_;
     if (harvest_v_pending_.slot >= 0) {
+        const int64_t t_wait = ggml_time_us();
         if (!kvmem_stageout_wait(harvest_v_pending_.slot, gpu_us)) {
             harvest_v_pending_.slot = -1;
         }
+        harvest_wait_us_ += ggml_time_us() - t_wait;
         const int slot = kvmem_stageout_submit(gpu_us);
         HarvestVBatch next;
         next.slot = slot;
         next.jobs = std::move(harvest_v_jobs_);
         harvest_v_jobs_.clear();
+        const int64_t t_write = ggml_time_us();
         harvest_write_batch();
+        harvest_write_us_ += ggml_time_us() - t_write;
         harvest_v_pending_ = std::move(next);
         if (harvest_v_pending_.slot < 0) {
             harvest_write_batch();
@@ -3527,12 +3538,18 @@ void llama_memory_kvmem::harvest_gpu_v_commit() {
     harvest_gpu_v_flush_slab();
     int64_t * gpu_us = retr_.enabled ? &retr_.stage_out_gpu_us : nullptr;
     if (harvest_v_pending_.slot >= 0) {
+        const int64_t t_wait = ggml_time_us();
         if (!kvmem_stageout_wait(harvest_v_pending_.slot, gpu_us)) {
             harvest_v_pending_.slot = -1;
         }
+        const int64_t t_write = ggml_time_us();
+        harvest_wait_us_ += t_write - t_wait;
         harvest_write_batch();
+        harvest_write_us_ += ggml_time_us() - t_write;
     } else if (!harvest_v_pending_.jobs.empty()) {
+        const int64_t t_write = ggml_time_us();
         harvest_write_batch();
+        harvest_write_us_ += ggml_time_us() - t_write;
     }
     kvmem_stageout_clear();
     harvest_gpu_queued_.clear();
@@ -3644,11 +3661,20 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
     }
 }
 
-void llama_memory_kvmem::harvest_full_blocks_async() {
+void llama_memory_kvmem::harvest_full_blocks_async(llama_pos done_before) {
     // Runtime block lengths cover the ENTIRE batch, while compute has only
-    // completed one ubatch. In reuse mode harvest at fenced stash/pressure/
-    // retrieval boundaries instead; do not publish an occupied but unwritten tail.
-    if (gpu_reuse_requested()) return;
+    // completed one ubatch. In reuse mode harvest only blocks that end before
+    // the ubatch that just completed, which earlier ubatches wrote in full; do
+    // not publish an occupied but unwritten tail. Without this, every resident
+    // block was harvested synchronously at stash time: 17-48 s to park a
+    // 51K-row conversation, against 0.1 s when prefill harvested as it went.
+    // KVMEM_REUSE_ASYNC_HARVEST=0 restores harvest-at-stash only.
+    static const bool reuse_async = [] {
+        const char * e = getenv("KVMEM_REUSE_ASYNC_HARVEST");
+        return !(e && e[0] == '0');
+    }();
+    const bool reuse = gpu_reuse_requested();
+    if (reuse && (!reuse_async || done_before <= 0)) return;
     if (retrieval_pinned_ || replay_ || v_trans_ || !raw_ || !kv_ || !runtime_) {
         return;
     }
@@ -3656,6 +3682,9 @@ void llama_memory_kvmem::harvest_full_blocks_async() {
     uint32_t n_enq = 0;
     for (const auto & b : store.blocks()) {
         if (b.gpu_slot < 0 || b.n_tokens != block_tokens_) {
+            continue;
+        }
+        if (reuse && (llama_pos) b.orig_pos_end() > done_before) {
             continue;
         }
         if (b.block_id < harvest_gpu_queued_.size() && harvest_gpu_queued_[b.block_id]) {
@@ -4915,7 +4944,8 @@ std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_r
     // 16.9 s for a 51K-row conversation instead of well under a second.
     kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
     const int64_t st_flush = ggml_time_us();
-    const uint64_t sync_jobs0 = harvest_sync_jobs_;
+    const uint64_t sync_jobs0 = harvest_sync_jobs_, submits0 = harvest_submits_;
+    const int64_t wait0 = harvest_wait_us_, write0 = harvest_write_us_;
     std::vector<uint32_t> resident;
     for (const auto & b : store.blocks()) {
         if (b.gpu_slot < 0 || b.n_tokens == 0) continue;
@@ -4985,11 +5015,14 @@ std::unique_ptr<llama_kvmem_stash> llama_memory_kvmem::stash_take(uint32_t max_r
     const int64_t st_trunc = ggml_time_us();
     stash_reset_empty(pool_preserve_);
     kvmem_diag("KVMEM_STASH_TAKE mean=%.1f flush=%.1f harvest_v=%.1f mtp=%.1f check=%.1f alloc=%.1f tags=%.1f "
-            "move=%.1f truncate=%.1f reset=%.1f resident=%zu rows=%u blocks=%u sync_jobs=%llu\n",
+            "move=%.1f truncate=%.1f reset=%.1f resident=%zu rows=%u blocks=%u sync_jobs=%llu "
+            "submits=%llu wait=%.1f write=%.1f\n",
             (st_mean - st0) / 1e3, (st_flush - st_mean) / 1e3, (st_harvest - st_flush) / 1e3, (st_mtp - st_harvest) / 1e3,
             (st_check - st_mtp) / 1e3, (st_alloc - st_check) / 1e3, (st_tags - st_alloc) / 1e3, (st_move - st_tags) / 1e3,
             (st_trunc - st_move) / 1e3, (ggml_time_us() - st_trunc) / 1e3, stash->resident.size(), rows,
-            stash->runtime->store().block_count(), (unsigned long long) (harvest_sync_jobs_ - sync_jobs0));
+            stash->runtime->store().block_count(), (unsigned long long) (harvest_sync_jobs_ - sync_jobs0),
+            (unsigned long long) (harvest_submits_ - submits0), (harvest_wait_us_ - wait0) / 1e3,
+            (harvest_write_us_ - write0) / 1e3);
     return stash;
 }
 
