@@ -1299,7 +1299,7 @@ size_t RawKvStore::allocated_bytes() const {
     for (const auto & b : blocks_) {
         bytes += b.layers.capacity() * sizeof(LayerBlk);
         for (const auto & l : b.layers) {
-            bytes += l.k.capacity() + l.v.capacity()*2 + l.k_gpu.capacity() + l.v_gpu.capacity();
+            bytes += l.k.capacity() + l.v.capacity()*2 + payload(l.k_gpu).capacity() + payload(l.v_gpu).capacity();
             bytes += l.k_sum.capacity()*sizeof(float);
         }
     }
@@ -1322,8 +1322,8 @@ void RawKvStore::snapshot_buffers(std::vector<SnapshotBuffer> & buffers) {
         // Empty allocations can be reclaimed too, without serializing capacity.
         if (l.k.capacity()) buffers.push_back(SnapshotBuffer::bind(l.k));
         if (l.v.capacity()) buffers.push_back(SnapshotBuffer::bind(l.v));
-        if (l.k_gpu.capacity()) buffers.push_back(SnapshotBuffer::bind(l.k_gpu));
-        if (l.v_gpu.capacity()) buffers.push_back(SnapshotBuffer::bind(l.v_gpu));
+        if (l.k_gpu && payload(l.k_gpu).capacity()) buffers.push_back(SnapshotBuffer::bind(l.k_gpu));
+        if (l.v_gpu && payload(l.v_gpu).capacity()) buffers.push_back(SnapshotBuffer::bind(l.v_gpu));
         if (l.k_sum.capacity()) buffers.push_back(SnapshotBuffer::bind(l.k_sum));
     }
 }
@@ -1341,13 +1341,13 @@ void RawKvStore::snapshot_write(SnapshotWriter & out) {
     for (const auto & b : blocks_) {
         uint64_t size = 0;
         for (const auto & l : b.layers) size += 4*4 + 2 + 5*8 + l.k.size() + l.v.size()*2 +
-            l.k_gpu.size() + l.v_gpu.size() + l.k_sum.size()*4;
+            payload(l.k_gpu).size() + payload(l.v_gpu).size() + l.k_sum.size()*4;
         out.scalar(size);
         for (const auto & l : b.layers) {
             out.scalar(l.n_tokens); out.scalar(l.k_gpu_tokens);
             out.scalar(l.v_gpu_tokens); out.scalar(l.mean_tokens);
             out.scalar(uint8_t(l.k_gpu_fmt)); out.scalar(uint8_t(l.v_gpu_fmt));
-            out.vector(l.k); out.vector(l.v); out.vector(l.k_gpu); out.vector(l.v_gpu); out.vector(l.k_sum);
+            out.vector(l.k); out.vector(l.v); out.vector(payload(l.k_gpu)); out.vector(payload(l.v_gpu)); out.vector(l.k_sum);
         }
     }
 }
@@ -1377,11 +1377,13 @@ void RawKvStore::snapshot_read(SnapshotReader & in, uint32_t max_blocks) {
             l.k_gpu_fmt = kfmt; l.v_gpu_fmt = vfmt;
             l.k = in.vector<uint8_t>(uint64_t(cfg_.block_tokens)*k_row_bytes());
             l.v = in.vector<uint16_t>(uint64_t(cfg_.block_tokens)*cfg_.n_embd_v);
-            l.k_gpu = in.vector<uint8_t>(uint64_t(cfg_.block_tokens)*cfg_.k_gpu_row_bytes);
-            l.v_gpu = in.vector<uint8_t>(uint64_t(cfg_.block_tokens)*cfg_.v_gpu_row_bytes);
+            l.k_gpu = std::make_shared<std::vector<uint8_t>>(
+                    in.vector<uint8_t>(uint64_t(cfg_.block_tokens)*cfg_.k_gpu_row_bytes));
+            l.v_gpu = std::make_shared<std::vector<uint8_t>>(
+                    in.vector<uint8_t>(uint64_t(cfg_.block_tokens)*cfg_.v_gpu_row_bytes));
             l.k_sum = in.vector<float>(cfg_.n_embd_k);
-            if ((l.k_gpu.size() < uint64_t(l.k_gpu_tokens)*cfg_.k_gpu_row_bytes) ||
-                (l.v_gpu.size() < uint64_t(l.v_gpu_tokens)*cfg_.v_gpu_row_bytes) ||
+            if ((payload(l.k_gpu).size() < uint64_t(l.k_gpu_tokens)*cfg_.k_gpu_row_bytes) ||
+                (payload(l.v_gpu).size() < uint64_t(l.v_gpu_tokens)*cfg_.v_gpu_row_bytes) ||
                 (l.mean_tokens && l.k_sum.size() != cfg_.n_embd_k))
                 throw std::runtime_error("incomplete snapshot KV block");
         }

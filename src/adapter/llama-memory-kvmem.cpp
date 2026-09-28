@@ -4670,7 +4670,7 @@ bool llama_memory_kvmem::pic_kv_commit(const kvmem_pic::kv_splice_plan & plan, s
         static_assert(std::is_nothrow_move_assignable<llama_kv_cells>::value, "PIC metadata publication must not allocate");
         runtime_.swap(next_runtime);
         raw_.swap(next_raw);
-        if (mtp_) mtp_->swap_raw(next_mtp);
+        if (mtp_) mtp_->swap_raw_with(next_mtp);
         row_positions_.swap(next_positions);
         free_slots_.swap(next_slots);
         kv_->v_cells[0] = std::move(next_cells);
@@ -5074,13 +5074,13 @@ bool llama_memory_kvmem::stash_put_prefix(std::unique_ptr<llama_kvmem_stash> sta
     runtime_.swap(stash->runtime);
     raw_.swap(stash->raw);
     row_positions_.swap(stash->row_positions);
-    if (mtp_) mtp_->swap_raw(stash->mtp_raw);
+    if (mtp_) mtp_->swap_raw_with(stash->mtp_raw);
     std::swap(approximate_from_, stash->approximate_from);
     const auto rollback = [&]() {
         runtime_.swap(stash->runtime);
         raw_.swap(stash->raw);
         row_positions_.swap(stash->row_positions);
-        if (mtp_) mtp_->swap_raw(stash->mtp_raw);
+        if (mtp_) mtp_->swap_raw_with(stash->mtp_raw);
         std::swap(approximate_from_, stash->approximate_from);
         stash_reset_empty();
     };

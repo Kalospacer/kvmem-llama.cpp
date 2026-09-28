@@ -150,8 +150,10 @@ public:
     void invalidate_cached_block(uint32_t id, uint32_t keep) { raw_->invalidate_packed_block(id, keep); }
     std::unique_ptr<kvmem::RawKvStore> take_raw();
     void put_raw(std::unique_ptr<kvmem::RawKvStore> raw) { raw_ = std::move(raw); }
-    // Retain the previous empty store for allocation-free restore rollback.
-    void swap_raw(std::unique_ptr<kvmem::RawKvStore> & raw) noexcept { raw_.swap(raw); }
+    // Fork's prefix/pool path exchanges stores with a caller-owned slot and
+    // keeps the outgoing empty store for an allocation-free rollback. Distinct
+    // from swap_raw() above, which takes ownership and marks the slot pool.
+    void swap_raw_with(std::unique_ptr<kvmem::RawKvStore> & raw) noexcept { raw_.swap(raw); }
 
 private:
     friend class llama_memory_kvmem;

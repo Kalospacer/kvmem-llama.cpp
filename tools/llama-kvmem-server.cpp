@@ -309,6 +309,10 @@ struct MultimodalQuery {
     std::string user;
     // Retain just the tokens and media identities, not native media/prompt storage.
     std::vector<llama_token> prefix;
+    // Media-bearing sessions freeze a prompt index alongside the tokens so the
+    // parked entry does not pin the native prompt storage. Empty for text-only
+    // queries, which is the common case.
+    std::shared_ptr<kvmem_prompt> media_index;
     std::vector<std::pair<uint32_t, std::string>> media;
     llama_kvmem_query_state state;
     size_t bytes() const {
@@ -318,6 +322,7 @@ struct MultimodalQuery {
             return data < object || data >= object + sizeof(s) ? s.capacity() + 1 : 0;
         };
         size_t n = sizeof(*this) + heap_string_bytes(user) + prefix.capacity()*sizeof(llama_token) +
+            (media_index ? media_index->index_bytes() : 0) +
             media.capacity()*sizeof(media[0]) + state.sum.capacity()*sizeof(state.sum[0]) +
             state.count.capacity()*sizeof(uint32_t);
         for (const auto & id : media) n += heap_string_bytes(id.second);
@@ -725,7 +730,9 @@ static uint64_t conversation_bytes(const ServerState & st, int id) {
         bytes += sizeof(MultimodalQuery) + query->user.capacity() + query->state.count.capacity()*sizeof(uint32_t);
         bytes += query->state.sum.capacity()*sizeof(std::vector<float>);
         for (const auto & sum : query->state.sum) bytes += sum.capacity()*sizeof(float);
-        if (query->prefix && query->prefix != prompt) bytes += query->prefix->index_bytes();
+        if (query->prefix.capacity() != (prompt ? prompt->tokens.capacity() : 0)) {
+            bytes += query->prefix.capacity()*sizeof(llama_token);
+        }
         for (const auto & media : query->media) bytes += sizeof(media) + media.second.capacity();
     }
     return bytes;
@@ -915,9 +922,9 @@ static void conversation_commit(ServerState & st, uint32_t stored) {
     }
     if (st.session_files) {
         if (st.cached_prompt && st.cached_prompt->has_media()) st.cached_prompt = st.cached_prompt->cache_index();
-        if (st.mm_query && st.mm_query->prefix && st.mm_query->prefix->has_media()) {
+        if (st.mm_query && st.mm_query->media_index && st.mm_query->media_index->has_media()) {
             auto query = std::make_shared<MultimodalQuery>(*st.mm_query);
-            query->prefix = query->prefix->cache_index(); st.mm_query = std::move(query);
+            query->media_index = query->media_index->cache_index(); st.mm_query = std::move(query);
         }
     }
     entry->second.stored = stored;

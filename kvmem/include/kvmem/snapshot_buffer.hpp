@@ -2,6 +2,8 @@
 
 #include "snapshot.hpp"
 
+#include <memory>
+
 namespace kvmem {
 // A frozen allocation, not a copy of its contents. Bindings remain valid only
 // while their owning detached store is frozen (no inference/vector relocation).
@@ -30,6 +32,33 @@ struct SnapshotBuffer {
         SnapshotBuffer b;
         b.object = &values; b.count = values.size(); b.size = uint64_t(values.size()) * sizeof(T);
         b.capacity = [](const void * p) { return uint64_t(static_cast<const std::vector<T> *>(p)->capacity()) * sizeof(T); };
+        b.write = [](const void * p, SnapshotWriter & out) { out.vector(*static_cast<const std::vector<T> *>(p)); };
+        b.read = [](void * p, uint64_t count, SnapshotReader & in) {
+            // Exact length comes from our in-memory manifest, never the file.
+            in.expect(count);
+            auto & v = *static_cast<std::vector<T> *>(p);
+            std::vector<T> next(static_cast<size_t>(count));
+            in.read(next.data(), count * sizeof(T));
+            v.swap(next);
+        };
+        b.clear = [](void * p) { std::vector<T>().swap(*static_cast<std::vector<T> *>(p)); };
+        return b;
+    }
+    // Packed K/V rows are shared between a store and every prefix clone taken
+    // from it. Freeing a frozen buffer is branch-local: retire this owner's
+    // reference, and the bytes stay while another branch still points at them.
+    // A sole owner releases the allocation, which is what the RAM accounting
+    // of a session swap expects.
+    template<class T> static SnapshotBuffer bind(std::shared_ptr<std::vector<T>> & values) {
+        static_assert(std::is_arithmetic<T>::value, "plain vector required");
+        SnapshotBuffer b;
+        auto * owned = values.get();
+        b.object = owned;
+        b.count = owned ? owned->size() : 0;
+        b.size = owned ? uint64_t(owned->size()) * sizeof(T) : 0;
+        b.capacity = [](const void * p) {
+            return uint64_t(static_cast<const std::vector<T> *>(p)->capacity()) * sizeof(T);
+        };
         b.write = [](const void * p, SnapshotWriter & out) { out.vector(*static_cast<const std::vector<T> *>(p)); };
         b.read = [](void * p, uint64_t count, SnapshotReader & in) {
             // Exact length comes from our in-memory manifest, never the file.
