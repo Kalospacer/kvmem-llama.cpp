@@ -2447,9 +2447,14 @@ int main(int argc, char ** argv) {
     kvmem_check_environment(kvmem_process_environment());
     auto arguments = kvmem_environment_args([](const char * name) { return std::getenv(name); });
     for (int i = 1; i < argc; ++i) arguments.push_back({argv[i], "cli"});
+    // The fork's conversation pool is on by default; upstream's multi-store cache
+    // is off by default. Remember whether the pool was configured on purpose, so
+    // asking for the other mode can switch the pool off instead of failing.
+    bool pool_explicit = false;
     for (size_t i = 0; i < arguments.size(); ++i) {
         argument_source = arguments[i].source;
         const char * arg = kvmem_server_arg_alias(arguments[i].value.c_str());
+        if (std::strncmp(arg, "--kvmem-pool-", 13) == 0 || eq(arg, "--pool-gpu-reuse")) pool_explicit = true;
         if (argument_source != "cli") config_inputs.emplace_back(arg, argument_source);
         const auto config_key = kvmem_config_key(arg);
         if (eq(arg, "--api-key") || eq(arg, "--api-key-file")) {
@@ -2777,6 +2782,18 @@ int main(int argc, char ** argv) {
     // default path prints nothing new.
     if (options.conversations > 1 && !st.kparams.enabled) {
         throw std::invalid_argument("--kvmem-conversations > 1 requires KVMem; drop --no-kvmem");
+    }
+    // Two conversation caches cannot share one sequence: the pool parks and
+    // restores host KV inside a request, while --kvmem-conversations swaps the
+    // whole host store before it. Pick one.
+    if (options.conversations > 1 && st.pool_enabled) {
+        if (pool_explicit) {
+            throw std::invalid_argument("--kvmem-conversations N > 1 and the conversation pool (--kvmem-pool-*) "
+                "are two different conversation caches; use one of them, or pass --no-kvmem-pool");
+        }
+        st.pool_enabled = false;
+        fprintf(stderr, "KVMEM_STARTUP conversation pool disabled: --kvmem-conversations %d selects the "
+                "multi-store cache\n", options.conversations);
     }
     if (options.conversation_bytes != 0 && options.conversations <= 1) {
         throw std::invalid_argument("--kvmem-conversations-gb caps the host stores that "

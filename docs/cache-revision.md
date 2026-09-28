@@ -81,6 +81,41 @@ return to the original each time. Measured on V100 with a 72,892-token fixture:
 returning after a mid-history branch went from 75.9 s to 1.5 s, returning after
 a cancelled one from 94.7 s to 0.7 s, and the tail branch stayed at 1.0 s.
 
+## Two conversation caches
+
+This tree carries two ways to keep several conversations' KV in host RAM. They
+cannot run together: the pool parks and restores host KV inside a request,
+while `--kvmem-conversations` swaps the whole host store before it.
+
+| | Conversation pool (default) | Multi-store cache (`--kvmem-conversations N`) |
+|---|---|---|
+| Unit | detached stash per parked branch | one whole host store per conversation |
+| Shared system prompt | prefix shared copy-on-write | one copy per conversation |
+| Restore | only rows up to the resume point | the whole working set |
+| Query state (Q) | carried with the entry | reset on switch |
+| Branch rule | message-start checkpoint or a deep drop | `rows - lcp <= last_n_gen + 64` |
+| Disk tier | none | `--kvmem-session-nvme-gb` |
+| Client id | none | `kvmem.conversation_id` |
+
+The pool's branch rule suits clients that rewrite a temporary tail every turn:
+the multi-store rule classifies such a turn as a branch and would park an
+unusable copy each time. The multi-store cache suits append-only clients,
+bounded disk spill and explicit conversation ids.
+
+Selection at startup:
+
+- No `--kvmem-conversations`: the pool runs as before.
+- `--kvmem-conversations N > 1` with no `--kvmem-pool-*` flag: the pool is
+  switched off and the server logs `KVMEM_STARTUP conversation pool disabled`.
+- Both given explicitly: startup fails and asks for one of them, or for
+  `--no-kvmem-pool`.
+
+The pool's decisions live in `tools/kvmem-pool-policy.h`, freestanding like
+`tools/kvmem-conversation-store.h`, and the server executes the plan it
+returns. `tests/conversation-pool-test.cpp` runs without a model or GPU and
+pins both production incidents above: each case also runs the pre-fix logic
+and shows it fails.
+
 ## Validation
 
 The source baseline was built for SM70 with MSVC and CUDA 12.9. The deployed

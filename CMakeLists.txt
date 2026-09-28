@@ -38,6 +38,12 @@ add_executable(kvmem-conversation-store-test tests/conversation-store-test.cpp)
 target_include_directories(kvmem-conversation-store-test PRIVATE tools)
 add_test(NAME kvmem-conversation-store-test COMMAND kvmem-conversation-store-test)
 
+# Conversation pool routing policy: header-only and free of llama.cpp and CUDA,
+# so the two production incidents it pins stay testable without a model or GPU.
+add_executable(kvmem-conversation-pool-test tests/conversation-pool-test.cpp)
+target_include_directories(kvmem-conversation-pool-test PRIVATE tools)
+add_test(NAME kvmem-conversation-pool-test COMMAND kvmem-conversation-pool-test)
+
 add_executable(kvmem-session-snapshot-test tests/session-snapshot-test.cpp)
 target_include_directories(kvmem-session-snapshot-test PRIVATE tools)
 target_link_libraries(kvmem-session-snapshot-test PRIVATE kvmem)

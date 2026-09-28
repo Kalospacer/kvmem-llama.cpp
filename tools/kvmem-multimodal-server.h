@@ -7,6 +7,8 @@
 #include <numeric>
 #include <map>
 
+#include "kvmem-pool-policy.h"
+
 static void pool_maintain(ServerState & st);
 
 static const char * multimodal_query_invalid(const ServerState & st, const MultimodalQuery & q,
@@ -364,24 +366,32 @@ static int pool_resume_row(const kvmem_prompt & prompt, int cap, const kvmem_pro
     return best;
 }
 
-// Would dropping rows (lcp, rows] lose something a later request can resume?
-// A checkpoint at a message start means a later turn of that branch lands
-// there; the rewritten tail of the current turn only holds query/end rows.
-// A per-turn rewritten tail is a few thousand rows. Dropping far more than that
-// abandons history (a client rewrote older context), even when the dropped span
-// holds no message-start checkpoint, e.g. one huge system message.
-static constexpr int kPoolDeepBranchRows = 16384;
+static pool_policy_limits pool_limits(const ServerState & st) {
+    return {st.pool_min_rows, st.pool_min_gain};
+}
 
+// Checkpoints that can carry recurrent state, with whether each sits on a
+// message-start token. Entries without data cannot be resumed from.
+static void pool_checkpoint_rows(const ServerState & st, const kvmem_prompt & cached,
+                                 const std::vector<MultimodalCheckpoint> & checkpoints,
+                                 std::vector<int> & rows, std::vector<bool> & is_msg) {
+    rows.clear();
+    is_msg.clear();
+    for (const auto & checkpoint : checkpoints) {
+        if (!checkpoint.data) continue;
+        rows.push_back(checkpoint.row);
+        is_msg.push_back(checkpoint.row >= 0 && checkpoint.row < (int) cached.tokens.size() &&
+                         cached.tokens[checkpoint.row] == st.mm_msg_token);
+    }
+}
+
+// See pool_branch_worth in kvmem-pool-policy.h.
 static bool pool_branch_worth(const ServerState & st, const kvmem_prompt & cached, int rows,
                               const std::vector<MultimodalCheckpoint> & checkpoints, int lcp, bool unrelated) {
-    if (rows < st.pool_min_rows || rows - std::max(lcp, 0) < st.pool_min_gain) return false;
-    const bool deep = rows - std::max(lcp, 0) >= kPoolDeepBranchRows;
-    for (const auto & checkpoint : checkpoints) {
-        if (!checkpoint.data || checkpoint.row <= lcp || checkpoint.row > rows) continue;
-        if ((unrelated || deep) && checkpoint.row >= st.pool_min_rows) return true;
-        if (checkpoint.row < (int) cached.tokens.size() && cached.tokens[checkpoint.row] == st.mm_msg_token) return true;
-    }
-    return false;
+    std::vector<int> ckpt_rows;
+    std::vector<bool> is_msg;
+    pool_checkpoint_rows(st, cached, checkpoints, ckpt_rows, is_msg);
+    return pool_branch_worth(pool_limits(st), ckpt_rows, is_msg, rows, lcp, unrelated);
 }
 
 enum class PoolAllocationKind { raw, checkpoint, query, prompt_estimate, metadata };
@@ -705,16 +715,10 @@ static PoolEntry * pool_stash_live(ServerState & st, const char * reason) {
         }
         if (query_anchor < 0) e->query.reset();
     }
-    // A later turn of this conversation resumes at a message start, and a
-    // rewrite of older context resumes somewhere inside the history. Keep the
-    // oldest entry, the Q anchor (else the newest row) and the first row of the
-    // current turn, where a rewritten last message resumes. Otherwise drop the
-    // checkpoint with the closest neighbours, non-message rows first, so the
-    // survivors stay spread over the conversation instead of the rewritten tail.
+    // The spread rule lives in kvmem-pool-policy.h and is pinned by
+    // tests/conversation-pool-test.cpp, so the shipped policy and the tested
+    // policy cannot drift.
     const auto & cached_tokens = st.cached_prompt->tokens;
-    auto msg_start = [&](const MultimodalCheckpoint & c) {
-        return c.row < (int) cached_tokens.size() && cached_tokens[c.row] == st.mm_msg_token;
-    };
     // The last message token opens the generated reply; the one before opens the turn.
     int turn_start = -1;
     for (int i = (int) cached_tokens.size() - 1, seen = 0; i >= 0; --i) {
@@ -723,39 +727,21 @@ static PoolEntry * pool_stash_live(ServerState & st, const char * reason) {
             break;
         }
     }
-    int turn_row = -1;
+    std::vector<int> kept_rows;
+    std::vector<bool> kept_is_msg;
     for (const auto & c : kept) {
-        if (turn_start >= 0 && c.row >= turn_start) {
-            turn_row = c.row;
-            break;
-        }
+        kept_rows.push_back(c.row);
+        kept_is_msg.push_back(c.row < (int) cached_tokens.size() && cached_tokens[c.row] == st.mm_msg_token);
     }
-    while ((int) kept.size() > st.pool_ckpts) {
-        auto protect = [&](size_t i) {
-            return i == 0 || kept[i].row == query_anchor || kept[i].row == turn_row ||
-                (query_anchor < 0 && i + 1 == kept.size());
-        };
-        size_t victim = kept.size();
-        int best_gap = INT_MAX;
-        for (int pass = 0; pass < 2 && victim == kept.size(); ++pass) {
-            for (size_t i = 1; i < kept.size(); ++i) {
-                if (protect(i) || (pass == 0 && msg_start(kept[i]))) continue;
-                const int gap = i + 1 < kept.size() ? kept[i + 1].row - kept[i - 1].row : kept[i].row - kept[i - 1].row;
-                if (gap < best_gap) {
-                    best_gap = gap;
-                    victim = i;
-                }
-            }
-        }
-        if (victim == kept.size()) {
-            // Only protected rows are left (small cap): keep the anchor, drop the turn row first.
-            auto it = std::find_if(kept.begin() + 1, kept.end(), [&](const auto & c) { return c.row == turn_row && c.row != query_anchor; });
-            if (it == kept.end()) it = std::find_if(kept.begin() + 1, kept.end(), [&](const auto & c) { return c.row != query_anchor; });
-            if (it == kept.end()) break;
-            victim = (size_t) (it - kept.begin());
-        }
-        kept.erase(kept.begin() + (std::ptrdiff_t) victim);
+    const auto survivors = pool_keep_checkpoints(std::move(kept_rows), std::move(kept_is_msg),
+                                                 st.pool_ckpts, query_anchor, turn_start);
+    std::vector<MultimodalCheckpoint> thinned;
+    thinned.reserve(survivors.size());
+    for (int row : survivors) {
+        const auto it = std::find_if(kept.begin(), kept.end(), [&](const auto & c) { return c.row == row; });
+        if (it != kept.end()) thinned.push_back(std::move(*it));
     }
+    kept = std::move(thinned);
     e->checkpoints = std::move(kept);
     e->bytes = llama_kvmem_stash_bytes(e->stash);
     e->created = e->last_used = std::chrono::steady_clock::now();
@@ -865,19 +851,27 @@ static void multimodal_pool_route(ServerState & st, const kvmem_prompt & prompt,
         const int cap = eval_end - (st.spec.ok ? 0 : 1);
         int live_lcp = 0;
         const int live_row = pool_resume_row(prompt, cap, st.cached_prompt.get(), st.mm_live_row, st.mm_checkpoints, &live_lcp);
-        size_t best = st.pool.size();
-        int best_row = -1, best_lcp = 0;
+        // Inputs for the freestanding decision in kvmem-pool-policy.h, which
+        // tests/conversation-pool-test.cpp pins.
+        std::vector<pool_entry> candidates(st.pool.size());
         for (size_t i = 0; i < st.pool.size(); ++i) {
-            int lcp = 0;
-            const int row = pool_resume_row(prompt, cap, st.pool[i]->prompt.get(), st.pool[i]->rows, st.pool[i]->checkpoints, &lcp);
-            if (row > best_row) {
-                best = i;
-                best_row = row;
-                best_lcp = lcp;
-            }
+            auto & c = candidates[i];
+            c.row = pool_resume_row(prompt, cap, st.pool[i]->prompt.get(), st.pool[i]->rows, st.pool[i]->checkpoints, &c.lcp);
+            c.rows = st.pool[i]->rows;
+            // Fork instead of consuming the entry when it continues far past the prefix.
+            c.valuable = c.row >= 0 &&
+                pool_branch_worth(st, *st.pool[i]->prompt, st.pool[i]->rows, st.pool[i]->checkpoints, c.lcp, false);
         }
         const bool live_valuable = st.cached_prompt && !st.cached_prompt->has_media() &&
             pool_branch_worth(st, *st.cached_prompt, st.mm_live_row, st.mm_checkpoints, live_lcp, live_row < 0);
+        pool_live live;
+        live.lcp = live_lcp;
+        live.row = live_row;
+        live.rows = st.mm_live_row;
+        live.valuable = live_valuable;
+        const pool_plan plan = pool_route(live, candidates, pool_limits(st));
+        int best_row = -1; // for the trace line: the best resume row over all entries
+        for (const auto & c : candidates) best_row = std::max(best_row, c.row);
         if (st.mm_live_row - std::max(live_lcp, 0) >= st.pool_min_gain) {
             // The request drops a large live tail: record why it is (not) parked.
             std::string after;
@@ -892,22 +886,22 @@ static void multimodal_pool_route(ServerState & st, const kvmem_prompt & prompt,
                     st.mm_live_row, live_lcp, live_row, (int) live_valuable, (int) st.mm_committed,
                     st.cached_prompt ? st.cached_prompt->tokens.size() : (size_t) 0, best_row, st.pool.size(), after.c_str());
         }
-        if (best < st.pool.size() && best_row >= std::max(live_row, 0) + st.pool_min_gain) {
-            const PoolEntry * target = st.pool[best].get();
-            if (live_valuable && pool_stash_live(st, "switch")) {
-                best = (size_t) (std::find_if(st.pool.begin(), st.pool.end(), [&](const auto & e) { return e.get() == target; }) - st.pool.begin());
-            } else {
-                memory_clear_all(st);
-            }
-            const PoolEntry & e = *st.pool[best];
-            const bool fork = pool_branch_worth(st, *e.prompt, e.rows, e.checkpoints, best_lcp, false);
-            pool_restore(st, best, best_row, !fork, best_lcp);
-        } else if (live_valuable) {
+        if (plan.action == pool_action::switch_in) {
+            const PoolEntry * target = st.pool[(size_t) plan.restore].get();
+            const int target_lcp = candidates[(size_t) plan.restore].lcp;
+            // Park the live branch if it is worth keeping, otherwise drop it.
+            // Parking appends to the pool, so the target is found again by identity.
+            if (!(plan.park_live && pool_stash_live(st, "switch"))) memory_clear_all(st);
+            const size_t index = (size_t) (std::find_if(st.pool.begin(), st.pool.end(),
+                    [&](const auto & e) { return e.get() == target; }) - st.pool.begin());
+            if (index < st.pool.size()) pool_restore(st, index, plan.resume, !plan.fork, target_lcp);
+        } else if (plan.action == pool_action::park_only) {
             // The request abandons the live branch: park it, keep only the shared prefix live.
-            PoolEntry * parked = pool_stash_live(st, live_row < 0 ? "miss" : "branch");
-            if (parked && live_row > 0) {
-                const size_t index = (size_t) (std::find_if(st.pool.begin(), st.pool.end(), [&](const auto & e) { return e.get() == parked; }) - st.pool.begin());
-                pool_restore(st, index, live_row, false, live_lcp);
+            PoolEntry * parked = pool_stash_live(st, plan.reason);
+            if (parked && plan.resume > 0) {
+                const size_t index = (size_t) (std::find_if(st.pool.begin(), st.pool.end(),
+                        [&](const auto & e) { return e.get() == parked; }) - st.pool.begin());
+                pool_restore(st, index, plan.resume, false, live_lcp);
             }
         }
     } catch (const std::exception & e) {
