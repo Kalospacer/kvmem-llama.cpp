@@ -56,11 +56,9 @@ try:
         ['--kvmem-conversations'], ['--kvmem-conversations', '2147483648'],
         ['--kvmem-conversations-gb', 'nan'], ['--kvmem-conversations-gb', 'inf'],
         ['--kvmem-conversations-gb', '-1'], ['--kvmem-conversations-gb', '1x'],
-        # Cross-checks, not value parsing: the cap needs N > 1 to cap, and
-        # several host stores need KVMem. Both throw, so both print the same
-        # "invalid arguments (source=...)" line the loop below asserts on.
-        ['--kvmem-conversations-gb', '24'],
-        ['--no-kvmem', '--kvmem-conversations', '2'],
+        # The session tier was removed with the multi-store cache.
+        ['--kvmem-session-ram-gb', '1'], ['--kvmem-session-nvme-gb', '1'],
+        ['--kvmem-session-cache-dir', 'cache'],
     ]
     for flags in invalid:
         r = subprocess.run([a.server, '-m', '__nonexistent__.gguf', *flags], env=env,
@@ -75,7 +73,9 @@ try:
                   ['--predict', '256', '-s', '123', '-mm', 'projector.gguf', '--no-webui'],
                   ['--timeout', '60', '--threads-http', '2', '--device', 'none'],
                   ['--kvmem-conversations', '1'],
-                  ['--kvmem-conversations', '8', '--kvmem-conversations-gb', '24']]:
+                  ['--kvmem-conversations', '8', '--kvmem-conversations-gb', '24'],
+                  ['--kvmem-conversations-gb', '24'], ['--no-kvmem', '--kvmem-conversations', '2'],
+                  ['--kvmem-conversations', '8', '--kvmem-pool-max', '3']]:
         r = subprocess.run([a.server, '-m', '__nonexistent__.gguf', *flags], env=env,
                            capture_output=True, timeout=20)
         check('accept ' + ' '.join(flags), b'failed to load model' in r.stderr)

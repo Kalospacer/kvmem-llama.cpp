@@ -1,5 +1,16 @@
 # Multi-conversation KV cache
 
+> **Replaced.** This implementation was removed from the server; the
+> conversation pool is now the only conversation cache. On the same requests
+> the pool took 294 s against 474 s, recomputed 148K instead of 273K tokens and
+> used 10.8 GB instead of 27.7 GB of private memory, mostly because this
+> design's branch rule recomputes every turn whose temporary tail a client
+> rewrites. `--kvmem-conversations N` and `--kvmem-conversations-gb G` now map
+> onto `--kvmem-pool-max` and `--kvmem-pool-gb`, `kvmem.conversation_id` is
+> ignored, and the session flags are startup errors. See
+> [One conversation cache](cache-revision.md#one-conversation-cache). The text
+> below describes the removed design.
+
 For the optional RAM/NVMe extension, capacity admission and disk restore, see
 [Session disk cache](session-disk-cache.md). The policy below describes the
 original RAM-only mode unless stated otherwise.

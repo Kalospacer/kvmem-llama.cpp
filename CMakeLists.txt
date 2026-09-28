@@ -32,12 +32,6 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 enable_testing()
 add_subdirectory(kvmem)
 
-# Conversation selection and eviction policy: header-only and free of llama.cpp
-# and CUDA, so it stays testable in the portable KVMEM_BUILD_LLAMA=OFF build.
-add_executable(kvmem-conversation-store-test tests/conversation-store-test.cpp)
-target_include_directories(kvmem-conversation-store-test PRIVATE tools)
-add_test(NAME kvmem-conversation-store-test COMMAND kvmem-conversation-store-test)
-
 # Conversation pool routing policy: header-only and free of llama.cpp and CUDA,
 # so the two production incidents it pins stay testable without a model or GPU.
 add_executable(kvmem-conversation-pool-test tests/conversation-pool-test.cpp)
@@ -48,11 +42,6 @@ add_executable(kvmem-session-snapshot-test tests/session-snapshot-test.cpp)
 target_include_directories(kvmem-session-snapshot-test PRIVATE tools)
 target_link_libraries(kvmem-session-snapshot-test PRIVATE kvmem)
 add_test(NAME kvmem-session-snapshot-test COMMAND kvmem-session-snapshot-test)
-
-add_executable(kvmem-session-transfer-test tests/session-transfer-test.cpp)
-target_include_directories(kvmem-session-transfer-test PRIVATE tools)
-target_link_libraries(kvmem-session-transfer-test PRIVATE kvmem)
-add_test(NAME kvmem-session-transfer-test COMMAND kvmem-session-transfer-test)
 
 option(KVMEM_BUILD_LLAMA "Build llama.cpp with the KVMem adapter" ON)
 option(KVMEM_ROCM "Build KVMem with the HIP/ROCm backend" OFF)

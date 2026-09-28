@@ -42,20 +42,15 @@ Core flags (what the 16 GiB recipes still pass):
 | `--kvmem-budget` | How many historical tokens retrieval may keep on GPU. |
 | `--kvmem-sink-tokens N` | Server and CLI: always keep the prefix in the GPU working set. Default `0` keeps one block (not disabled). Positive values round down to whole blocks, with a minimum of one block. For example, with block size 128, `1024` keeps 1024 tokens and `129` keeps 128. These blocks count toward `--kvmem-budget`. |
 | `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. **One generation cannot exceed this length** (including thinking). |
-| `--kvmem-conversations N` | How many conversations retain their KV in host RAM or the optional session disk cache. Default `1` reproduces earlier behavior, where a different conversation discards the previous one. Higher values let the server switch between conversations without reprocessing them; requests are still served one at a time. Needs flash attention. |
-| `--kvmem-conversations-gb GB` | Soft cap on accounted RAM summed over active and inactive sessions. Move inactive sessions to NVMe by LRU when enabled, or evict them when RAM-only; an oversized active session continues with a warning. Default `0` means no byte cap. Requires `--kvmem-conversations N` with `N > 1`. |
-| `--kvmem-session-ram-gb GB` | Alias for the total active + inactive session RAM **soft** cap. Active KV may exceed it; idle KV moves to NVMe by LRU when enabled. `0` remains unlimited. |
-| `--kvmem-session-nvme-gb GB` | Enable disk storage for inactive sessions with this total quota. RAM pressure spills sessions to disk; disk pressure discards them by LRU. Default `0` disables it. |
-| `--kvmem-session-cache-dir PATH` | Directory on your NVMe/SSD for the session files; required when session disk caching is enabled. |
+| `--kvmem-conversations N` | Legacy flag of the removed multi-store cache: `N > 1` enables the conversation pool with `--kvmem-pool-max N`. An explicit `--kvmem-pool-max` wins. |
+| `--kvmem-conversations-gb GB` | Legacy flag: `GB > 0` sets `--kvmem-pool-gb GB`. An explicit `--kvmem-pool-gb` wins. The `--kvmem-session-*` flags were removed with the session tier and are startup errors. |
 | `--kv-dtype` | Sets the same cache type for **main** attention K and V (IQ3 q8_0, IQ4 q5_0). Use `-ctk q8_0 -ctv q4_0` for mixed precision. |
 | `--spec-type draft-mtp` | Enable multi-token prediction. |
 | `--mmproj` | Vision projector GGUF. Omit for text-only. |
 
 KVMem retrieval is on by default, with 128-token blocks, query replay `auto`, query policy `user`, MTP draft length 3, F16 draft KV, and ReplaySSM. You do not need to pass those unless you are overriding them. GPU KV size is `budget + gen_reserve`. When history exceeds `--kvmem-budget`, retrieval picks blocks for the current last-user query. Clients should send the full `messages` history each turn.
 
-With `--kvmem-conversations` above 1, that history is also the conversation's identity: no client API change and no conversation id are required. A request that continues a stored conversation extends it, while a request that only shares a system prompt or chat template starts a separate one instead of truncating the stored tail. A match is usable only when a recurrent checkpoint exists at or before it; otherwise the request is an ordinary cache miss. Details and limits are in [Multi-conversation KV cache](docs/multi-conversation-kv-cache.md).
-
-For example, add `--kvmem-conversations 3 --kvmem-session-ram-gb 12 --kvmem-session-nvme-gb 40 --kvmem-session-cache-dir D:/KVMem/session-cache` to retain sessions across RAM and disk. The active session must fit the machine's actual RAM. See [Session disk cache](docs/session-disk-cache.md) for accounting and recovery, the [1:10 multi-session stability test](docs/session-exchange-stability.md) for the large exchange check, and the [three-session 5 GiB K8/V4 test](docs/three-session-5g-k8v4-stability.md) for a real-model 10 GiB NVMe and cold-prefill comparison.
+That history is also the conversation's identity for the conversation pool, which is on by default and is the only conversation cache: no client API change and no conversation id are required (`kvmem.conversation_id` is accepted and ignored). See [One conversation cache](docs/cache-revision.md#one-conversation-cache) for why it replaced the multi-store cache.
 
 ## How KVMem attaches to llama.cpp
 

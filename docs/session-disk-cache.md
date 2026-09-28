@@ -1,5 +1,11 @@
 # Session KV cache in RAM and on NVMe
 
+> **Removed.** The session tier went with the multi-store cache; the
+> conversation pool is now the only conversation cache and
+> `--kvmem-session-*` are startup errors. See
+> [One conversation cache](cache-revision.md#one-conversation-cache). The text
+> below describes the removed design.
+
 This extends the session ownership and matching introduced by PR #45. There
 is still one active inference slot and one GPU working set. Inactive sessions
 can retain their host KV in RAM or move their large payloads to an SSD/NVMe

@@ -81,40 +81,42 @@ return to the original each time. Measured on V100 with a 72,892-token fixture:
 returning after a mid-history branch went from 75.9 s to 1.5 s, returning after
 a cancelled one from 94.7 s to 0.7 s, and the tail branch stayed at 1.0 s.
 
-## Two conversation caches
+## One conversation cache
 
-This tree carries two ways to keep several conversations' KV in host RAM. They
-cannot run together: the pool parks and restores host KV inside a request,
-while `--kvmem-conversations` swaps the whole host store before it.
+The conversation pool is the only cache that keeps several conversations' KV
+in host RAM. Upstream's multi-store cache (`--kvmem-conversations N`, one whole
+host store per conversation, with an optional session disk tier) was removed
+from the server after an A/B run on the V100 with the same binary and the same
+18 requests, whose answers matched word for word:
 
-| | Conversation pool (default) | Multi-store cache (`--kvmem-conversations N`) |
+| | Pool | Multi-store |
 |---|---|---|
-| Unit | detached stash per parked branch | one whole host store per conversation |
-| Shared system prompt | prefix shared copy-on-write | one copy per conversation |
-| Restore | only rows up to the resume point | the whole working set |
-| Query state (Q) | carried with the entry | reset on switch |
-| Branch rule | message-start checkpoint or a deep drop | `rows - lcp <= last_n_gen + 64` |
-| Disk tier | none | `--kvmem-session-nvme-gb` |
-| Client id | none | `kvmem.conversation_id` |
+| Total wall time | 294 s | 474 s |
+| Recomputed tokens | 148K | 273K |
+| Process private memory | 10.8 GB | 27.7 GB |
+| AstrBot-style turn (rewritten temporary tail) | ~11 s | 37-51 s |
 
-The pool's branch rule suits clients that rewrite a temporary tail every turn:
-the multi-store rule classifies such a turn as a branch and would park an
-unusable copy each time. The multi-store cache suits append-only clients,
-bounded disk spill and explicit conversation ids.
+The multi-store branch rule (`rows - lcp <= last_n_gen + 64`) classifies every
+rewritten-tail turn as a new conversation and recomputes it in full, and it
+cannot share a system prompt across stores.
 
-Selection at startup:
+Its flags still parse, so existing launch scripts start:
 
-- No `--kvmem-conversations`: the pool runs as before.
-- `--kvmem-conversations N > 1` with no `--kvmem-pool-*` flag: the pool is
-  switched off and the server logs `KVMEM_STARTUP conversation pool disabled`.
-- Both given explicitly: startup fails and asks for one of them, or for
-  `--no-kvmem-pool`.
+- `--kvmem-conversations N`: `N > 1` enables the pool with
+  `--kvmem-pool-max N`; `N <= 1` does nothing.
+- `--kvmem-conversations-gb G`: `G > 0` sets `--kvmem-pool-gb G`.
+- An explicit `--kvmem-pool-max` / `--kvmem-pool-gb` wins over the mapped
+  value. Either way the server prints one `KVMEM_STARTUP --kvmem-conversations`
+  line saying what it did.
+- `--kvmem-session-ram-gb`, `--kvmem-session-nvme-gb` and
+  `--kvmem-session-cache-dir` are startup errors: the session tier was removed
+  with the multi-store cache.
+- `kvmem.conversation_id` in a request is accepted and ignored.
 
-The pool's decisions live in `tools/kvmem-pool-policy.h`, freestanding like
-`tools/kvmem-conversation-store.h`, and the server executes the plan it
-returns. `tests/conversation-pool-test.cpp` runs without a model or GPU and
-pins both production incidents above: each case also runs the pre-fix logic
-and shows it fails.
+The pool's decisions live in `tools/kvmem-pool-policy.h`, freestanding, and the
+server executes the plan it returns. `tests/conversation-pool-test.cpp` runs
+without a model or GPU and pins both production incidents above: each case
+also runs the pre-fix logic and shows it fails.
 
 ## Validation
 
@@ -160,13 +162,15 @@ passes the host tests on Windows (NVMe off, sm_70):
 
 - `kvmem_store_test`, `pinned_kv_tier_test`, `resident_tags_test` (COW, MTP,
   epochs, owner budget)
-- `kvmem-conversation-store-test` (upstream policy, 77,440 combinations)
 - `kvmem-conversation-pool-test` (pool policy, both incidents)
+- `kvmem-session-snapshot-test` (RawKvStore snapshot roundtrip, bounds and
+  checksum)
 
-`kvmem-session-snapshot-test` and `kvmem-session-transfer-test` crash with
-0xC0000409 on Windows **on upstream alone**, verified against a pristine
-upstream build, so they are not a regression from this merge. They are
-POSIX-only in the upstream CMake and are not built by the Windows test list.
+The multi-store cache's tests (`kvmem-conversation-store-test`,
+`kvmem-session-transfer-test`) went with it. `kvmem-session-snapshot-test`
+kept only its RawKvStore part, which still covers the kvmem library; the session
+file part, which crashed with 0xC0000409 on Windows on upstream alone, was
+removed with the session tier.
 
 The Pool and PIC sections above describe the fork's features. PIC remains off
 by default and is not beneficial at its current 512-token segment size; the

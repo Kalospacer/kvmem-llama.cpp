@@ -115,7 +115,6 @@ inline std::string kvmem_config_key(const char * raw) {
         {"-ctv", "--cache-type-v"}, {"--no-ui", "--ui"}, {"--webui", "--ui"},
         {"--no-jinja", "--jinja"}, {"--no-mmproj-offload", "--mmproj-offload"},
         {"--chat-template-file", "--chat-template"}, {"--no-kvmem", "--kvmem"},
-        {"--kvmem-session-ram-gb", "--kvmem-conversations-gb"},
     };
     const auto it = aliases.find(arg);
     return it == aliases.end() ? arg : it->second;

@@ -87,17 +87,14 @@ int main() {
     check(kvmem_config_key("-ngl") == "--n-gpu-layers");
     check(kvmem_config_key("--path") == "--ui-dir");
     check(kvmem_config_key("--no-mmap") == "--load-mode");
-    // Multi-conversation host stores: absent flags must reproduce the
-    // single-store server, so the struct defaults are part of the contract.
+    // Legacy multi-store flags, mapped onto the conversation pool at startup:
+    // absent flags must leave the pool's own defaults alone.
     check(kvmem_server_options{}.conversations == 1);
-    check(kvmem_server_options{}.conversation_bytes == 0);
-    check(o.conversations == 1 && o.conversation_bytes == 0);
-    parse("--kvmem-session-ram-gb", "1.5"); check(o.conversation_bytes == 1610612736ull);
-    parse("--kvmem-session-nvme-gb", "2"); check(o.session_disk_bytes == 2147483648ull);
-    parse("--kvmem-session-cache-dir", "D:/session cache"); check(o.session_cache_dir == "D:/session cache");
-    for (const char * bad : {"nan", "inf", "-1", "2gb", "1048577"})
-        rejects([&] { parse("--kvmem-session-nvme-gb", bad); });
-    rejects([&] { parse("--kvmem-session-cache-dir", ""); });
+    check(kvmem_server_options{}.conversations_gb == 0);
+    check(o.conversations == 1 && o.conversations_gb == 0);
+    // The session tier was removed with the multi-store cache.
+    for (const char * flag : {"--kvmem-session-ram-gb", "--kvmem-session-nvme-gb", "--kvmem-session-cache-dir"})
+        rejects([&] { parse(flag, "1"); });
     for (const char * value : {"1", "2", "8", "64", "2147483647"}) {
         parse("--kvmem-conversations", value);
         check(o.conversations == std::stoi(value));
@@ -108,11 +105,11 @@ int main() {
         throw std::invalid_argument("missing value");
     }); });
     parse("--kvmem-conversations-gb", "0");
-    check(o.conversation_bytes == 0);
+    check(o.conversations_gb == 0);
     parse("--kvmem-conversations-gb", "0.5");
-    check(o.conversation_bytes == 536870912ull);
+    check(o.conversations_gb == 0.5);
     parse("--kvmem-conversations-gb", "24");
-    check(o.conversation_bytes == 24ull << 30);
+    check(o.conversations_gb == 24);
     for (const char * value : {"-1", "nan", "inf", "1x", "", " 1", "1048577"})
         rejects([&] { parse("--kvmem-conversations-gb", value); });
     rejects([&] { o.parse("--kvmem-conversations-gb", [](const char *) -> const char * {

@@ -62,13 +62,10 @@ inline int kvmem_cli_gpu_layers(const char * option, const char * value) {
 
 struct kvmem_server_options {
     int sink_tokens = 0; // Zero keeps one block; positive values round down to whole blocks.
-    // Live host KV stores, time-multiplexed on one GPU working set. One
-    // reproduces the single-store server, where a different conversation
-    // discards the previous one.
+    // Flags of the removed multi-store cache, mapped onto the conversation
+    // pool at startup: N > 1 sets --kvmem-pool-max, GB > 0 sets --kvmem-pool-gb.
     int conversations = 1;
-    uint64_t conversation_bytes = 0; // Accounted host store bytes; zero = count cap only.
-    uint64_t session_disk_bytes = 0;
-    std::string session_cache_dir;
+    double conversations_gb = 0;
     int verbosity = 3; // Same default and levels as llama-server.
     int trace = -1; // -1 inherits KVMEM_TRACE; CLI overrides only after parsing.
     int threads = -1;
@@ -163,16 +160,12 @@ struct kvmem_server_options {
             sink_tokens = kvmem_cli_int(arg.c_str(), need(arg.c_str()));
         } else if (arg == "--kvmem-conversations") {
             conversations = kvmem_cli_int(arg.c_str(), need(arg.c_str()), 1);
-        } else if (arg == "--kvmem-conversations-gb" || arg == "--kvmem-session-ram-gb") {
-            const double gb = kvmem_cli_real(arg.c_str(), need(arg.c_str()), 0, 1048576);
-            conversation_bytes = gb <= 0.0 ? 0
-                : static_cast<uint64_t>(gb * 1024.0 * 1024.0 * 1024.0);
-        } else if (arg == "--kvmem-session-nvme-gb") {
-            const double gb = kvmem_cli_real(arg.c_str(), need(arg.c_str()), 0, 1048576);
-            session_disk_bytes = static_cast<uint64_t>(gb * 1024.0 * 1024.0 * 1024.0);
-        } else if (arg == "--kvmem-session-cache-dir") {
-            session_cache_dir = need(arg.c_str());
-            if (session_cache_dir.empty()) throw std::invalid_argument("session cache directory is empty");
+        } else if (arg == "--kvmem-conversations-gb") {
+            conversations_gb = kvmem_cli_real(arg.c_str(), need(arg.c_str()), 0, 1048576);
+        } else if (arg == "--kvmem-session-ram-gb" || arg == "--kvmem-session-nvme-gb" ||
+                   arg == "--kvmem-session-cache-dir") {
+            throw std::invalid_argument(arg + " was removed: the session tier went with the multi-store "
+                "cache, and the conversation pool (--kvmem-pool-*) is the only conversation cache");
         } else if (arg == "--kvmem-trace" || arg == "--no-kvmem-trace") {
             trace = arg == "--kvmem-trace" ? 1 : 0;
         } else if (arg == "-lv" || arg == "--verbosity" || arg == "--log-verbosity") {

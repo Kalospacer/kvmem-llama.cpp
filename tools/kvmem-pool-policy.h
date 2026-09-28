@@ -2,11 +2,10 @@
 
 // Routing policy for the conversation pool.
 //
-// Freestanding on purpose, like tools/kvmem-conversation-store.h: no llama.h,
-// no ServerState, no logging, no globals. The server computes every input --
-// the longest common token prefix in particular, which is media-aware and
-// lives in kvmem_prompt::common_prefix -- and executes the plan this file
-// returns. This file only decides.
+// Freestanding on purpose: no llama.h, no ServerState, no logging, no
+// globals. The server computes every input -- the longest common token prefix
+// in particular, which is media-aware and lives in kvmem_prompt::common_prefix
+// -- and executes the plan this file returns. This file only decides.
 //
 //   c++ -std=c++17 -I tools -o /tmp/pool-test tests/conversation-pool-test.cpp && /tmp/pool-test
 //

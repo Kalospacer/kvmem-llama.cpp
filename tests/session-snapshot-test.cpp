@@ -1,6 +1,6 @@
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/snapshot.hpp"
-#include "kvmem-session-files.h"
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 
@@ -10,36 +10,7 @@ template<class F> static void rejects(F f) {
     throw std::runtime_error("expected snapshot failure");
 }
 
-static void large_file() {
-    // Exercise the >4 GiB boundary with 1 MiB of working memory, rather than
-    // relying on a model's context length to produce a sufficiently big file.
-    const uint64_t size = (uint64_t(4) << 30) + 137;
-    const auto root = std::filesystem::temp_directory_path() /
-        ("kvmem-large-snapshot-test-" + std::to_string(std::random_device{}()));
-    std::vector<uint8_t> chunk(kvmem::snapshot_chunk, 0xa7);
-    {
-        kvmem_session_files files(root, size+8);
-        files.save(1, size, [&](kvmem::SnapshotWriter & out) {
-            for (uint64_t left = size; left;) {
-                const auto n = std::min<uint64_t>(left, chunk.size());
-                out.write(chunk.data(), n); left -= n;
-            }
-        });
-        check(files.bytes() == size+8 && std::filesystem::file_size(files.path(1)) == size+8);
-        files.load(1, [&](kvmem::SnapshotReader & in) {
-            while (in.remaining()) {
-                const auto n = std::min<uint64_t>(in.remaining(), chunk.size());
-                in.read(chunk.data(), n);
-                check(chunk[0] == 0xa7 && chunk[size_t(n)-1] == 0xa7);
-            }
-        });
-    }
-    std::filesystem::remove(root);
-    std::cout << ">4 GiB streaming file roundtrip and quota passed\n";
-}
-
-int main(int argc, char ** argv) {
-    if (argc == 2 && std::string(argv[1]) == "--large-file") { large_file(); return 0; }
+int main() {
     kvmem::RawKvStoreConfig cfg;
     cfg.n_layer = 3; cfg.n_embd_k = 64; cfg.n_embd_v = 64; cfg.block_tokens = 64;
     cfg.k_gpu_row_bytes = 68; cfg.v_gpu_row_bytes = 128;
@@ -99,41 +70,5 @@ int main(int argc, char ** argv) {
     std::memcpy(bad_length.data()+4*5+3*8, &insane, sizeof(insane));
     rejects([&] { read(bad_length, restored); });
 
-    const auto root = std::filesystem::temp_directory_path() /
-        ("kvmem-snapshot-test-" + std::to_string(std::random_device{}()));
-    std::filesystem::create_directory(root);
-    const auto sentinel = root / "user-file"; std::ofstream(sentinel) << "keep";
-    std::filesystem::path run;
-    {
-        const uint64_t file_bytes = size.bytes()+8;
-        kvmem_session_files files(root, file_bytes); run = files.directory();
-        kvmem_session_files other(root, file_bytes);
-        check(run != other.directory());
-        files.save(1, size.bytes(), [&](kvmem::SnapshotWriter & writer) {
-            check(files.bytes() == file_bytes); write(writer);
-        });
-        check(files.bytes() == file_bytes && std::filesystem::file_size(files.path(1)) == file_bytes);
-        rejects([&] { files.save(2, size.bytes(), write); });
-        check(!files.contains(2));
-        files.load(1, [&](kvmem::SnapshotReader & in) { restored.snapshot_read(in, (tokens+63)/64); });
-        {
-            std::fstream file(files.path(1), std::ios::binary|std::ios::in|std::ios::out);
-            file.seekg(-1, std::ios::end); char byte; file.read(&byte, 1); byte ^= 1;
-            file.seekp(-1, std::ios::end); file.write(&byte, 1);
-        }
-        rejects([&] { files.load(1, [&](kvmem::SnapshotReader & in) { restored.snapshot_read(in, (tokens+63)/64); }); });
-        check(files.erase(1) && files.bytes() == 0);
-        rejects([&] { files.save(2, size.bytes(), [&](kvmem::SnapshotWriter & writer) {
-            writer.scalar(uint32_t(1)); throw std::runtime_error("injected short write");
-        }); });
-        check(files.bytes() == 0 && !files.contains(2));
-        files.save(3, size.bytes(), write);
-        std::filesystem::resize_file(files.path(3), 23);
-        rejects([&] { files.load(3, [&](kvmem::SnapshotReader & in) { restored.snapshot_read(in, (tokens+63)/64); }); });
-        // Destruction removes only this run's tracked files.
-        check(std::filesystem::exists(sentinel));
-    }
-    check(!std::filesystem::exists(run) && std::filesystem::exists(sentinel));
-    std::filesystem::remove(sentinel); std::filesystem::remove(root);
-    std::cout << "snapshot roundtrip, bounds, checksum, quota, short write and cleanup passed\n";
+    std::cout << "snapshot roundtrip, bounds and checksum passed\n";
 }
