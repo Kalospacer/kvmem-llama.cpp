@@ -186,6 +186,7 @@ static void test_store_bytes() {
 
     raw.clear();
     CHECK(raw.bytes_k() == 0 && raw.bytes_v() == 0);
+}
 using Allocations = std::map<const void *, size_t>;
 
 static Allocations allocations(const kvmem::RawKvStore & raw) {
