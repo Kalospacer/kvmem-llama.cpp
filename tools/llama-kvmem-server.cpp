@@ -1649,6 +1649,9 @@ static json usage_json(int n_prompt, int n_gen, int n_cache_hit) {
         {"prompt_tokens", n_prompt},
         {"completion_tokens", n_gen},
         {"total_tokens", n_prompt + n_gen},
+        // OpenAI 标准字段：下游（cpa 的 key-billing 等）按它算"缓存读"。
+        // 只发下面的 prompt_cache_hit_tokens 时，客户端拿不到标准字段，缓存读会恒为 0。
+        {"prompt_tokens_details", json{{"cached_tokens", n_cache_hit}}},
         {"prompt_cache_hit_tokens", n_cache_hit},
         {"prompt_cache_miss_tokens", n_prompt - n_cache_hit},
     };
